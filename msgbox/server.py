@@ -12,7 +12,7 @@ import argparse
 
 APP = sanic.Sanic('MsgBox')
 start_time = time.strftime('%y%m%d-%H%M%S')
-signal.alarm(random.randint(1, 10))
+signal.alarm(random.randint(1, 30))
 
 TERMS = dict()
 READER_INFO = dict()
@@ -37,12 +37,6 @@ def largest_filename(path):
     return max(filenames) if filenames else -1
 
 
-# Read the content of a file
-def blob_load(path, term, seq):
-    with open(abspath(path, term, seq), 'rb') as fd:
-        return fd.read()
-
-
 # Atomic file creation. Write a tmp file and then move to final path
 def blob_dump(path, term, seq, blob):
     term_dir = abspath(path, term)
@@ -56,6 +50,11 @@ def blob_dump(path, term, seq, blob):
         fd.write(blob)
 
     os.rename(tmppath, path)
+
+
+@APP.get('/')
+async def servers(request):
+    return sanic.response.json(ARGS.servers)
 
 
 # We vote only once for a term in our lifetime
@@ -187,7 +186,8 @@ async def msgbox_post(request, path):
 @APP.get('/blob/<path:path>/<term:int>/<seq:int>')
 async def blob_read(request, path, term, seq):
     if os.path.isfile(abspath(path, term, seq)):
-        return sanic.response.raw(blob_load(path, term, seq))
+        with open(abspath(path, term, seq), 'rb') as fd:
+            return sanic.response.raw(fd.read())
 
     return sanic.response.raw(b'', status=404)
 
@@ -284,17 +284,16 @@ async def paxos_client(request, path, term, seq):
         max_seq_set = set([v['max_seq'] for v in res.values()])
 
         res = [v for v in res.values() if 'OK' == v['status']]
-        if ARGS.quorum > len(res):
-            if 1 == len(max_seq_set):
-                term_state['committed'] = max_seq
-            else:
-                term_state['committed'] = max_seq - 1
+        if 1 == len(max_seq_set):
+            term_state['committed'] = max_seq
+        else:
+            term_state['committed'] = max_seq - 1
 
     # There is already a new leader and this term is obsolete
     # At least a majority of nodes have the same max seq for this term
     # This term can be safely finalized with the above seq as the final file
     if not term_state['closed'] and seq > term_state['committed']:
-        if len(res) >= ARGS.quorum and 1 == len(max_seq_set):
+        if len([True for v in res if max_seq == v['max_seq']]) >= ARGS.quorum:
             proposal = (0, max_seq)
             for val in res:
                 if val['accepted_seq'] > proposal[0]:
@@ -326,7 +325,8 @@ async def paxos_client(request, path, term, seq):
         return sanic.response.json('OUT_OF_RANGE', status=400)
 
     # We are good to return the file for this seq
-    return sanic.response.raw(blob_load(path, term, seq))
+    with open(abspath(path, term, seq), 'rb') as fd:
+        return sanic.response.raw(fd.read())
 
 
 def allowed(request):
