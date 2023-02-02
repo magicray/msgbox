@@ -1,17 +1,23 @@
 import sys
+import json
 import time
 import hashlib
-import msgbox.client
-from logging import critical as log
+import msgbox
+
+
+def main(conf_file, path, term, seq):
+    client = msgbox.Client(conf_file)
+
+    for r in client.tail(path, term, seq):
+        if not r.get('blob', None):
+            json_dump = json.dumps(r, indent=4, sort_keys=True)
+            sys.stderr.write(json_dump + '\n')
+            time.sleep(1)
+        else:
+            sys.stdout.write('{} {} {}/{}/{}\n'.format(
+                hashlib.md5(r['blob']).hexdigest(), len(r['blob']),
+                r['path'], r['term'], r['seq']))
 
 
 if '__main__' == __name__:
-    for r in msgbox.client.tail(sys.argv[1]):
-        url = '{server}/{path}/{term}/{seq}'.format(**r)
-        if 'ok' == r['status']:
-            print('{} {} {}'.format(
-                hashlib.md5(r['blob']).hexdigest(),
-                len(r['blob']), url))
-        else:
-            log('{} {}'.format(r['status'], url))
-            time.sleep(1)
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])

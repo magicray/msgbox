@@ -12,7 +12,7 @@ import argparse
 
 APP = sanic.Sanic('MsgBox')
 start_time = time.strftime('%y%m%d-%H%M%S')
-signal.alarm(random.randint(1, 30))
+signal.alarm(random.randint(1, 10))
 
 TERMS = dict()
 READER_INFO = dict()
@@ -52,14 +52,9 @@ def blob_dump(path, term, seq, blob):
     os.rename(tmppath, path)
 
 
-@APP.get('/')
-async def servers(request):
-    return sanic.response.json(ARGS.servers)
-
-
 # We vote only once for a term in our lifetime
 # Agree if and only if this term is biggest seen so far
-@APP.get('/vote/<path:path>/<term:int>')
+@APP.get('/-/vote/<path:path>/<term:int>')
 async def vote(request, path, term):
     term = int(term)
 
@@ -80,7 +75,7 @@ async def vote(request, path, term):
     return sanic.response.json(dict(status='OBSOLETED'))
 
 
-@APP.get('/info/<path:path>')
+@APP.get('/-/info/<path:path>')
 async def path_info(request, path):
     TERMS[path] = largest_filename(path)
 
@@ -90,11 +85,11 @@ async def path_info(request, path):
         leader=WRITE_LEADERS.get(path, None)))
 
 
-@APP.get('/leader/<path:path>')
-async def leader(request, path):
+@APP.get('/-/leader/<path:path>')
+async def elect(request, path):
     for i in range(2):
         # Lets find if we have an active leader
-        res = await Client.multi_get('info/{}'.format(path))
+        res = await Client.multi_get('-/info/{}'.format(path))
 
         # Found a leader. Could be from an older term though.
         # Even if it is from an older term, we are safe as
@@ -114,7 +109,7 @@ async def leader(request, path):
 
         # Lets solicit vote for this node as the leader for the next term
         term = max([r['term'] for r in res.values()])
-        res = await Client.multi_get('vote/{}/{}'.format(path, term+1))
+        res = await Client.multi_get('-/vote/{}/{}'.format(path, term+1))
 
         votes = [True for r in res.values() if 'OK' == r['status']]
 
@@ -138,7 +133,7 @@ async def leader(request, path):
 
 
 # Write a new blob. Invalidate the cached term if this one is larger
-@APP.post('/blob/<path:path>/<term:int>/<seq:int>')
+@APP.post('/-/blob/<path:path>/<term:int>/<seq:int>')
 async def blob_write(request, path, term, seq):
     term, seq = int(term), int(seq)
 
@@ -157,33 +152,7 @@ async def blob_write(request, path, term, seq):
     return sanic.response.json(dict(status='OK'))
 
 
-@APP.post('/msgbox/<path:path>')
-async def msgbox_post(request, path):
-    async with WRITE_LOCKS.setdefault(path, asyncio.Lock()):
-        leader = WRITE_LEADERS.pop(path, None)
-
-        if leader is None:
-            return sanic.response.json(dict(status='NOT_A_LEADER'), status=400)
-
-        url = 'blob/{}/{}/{}'.format(path, leader['term'], leader['seq'])
-        res = await Client.multi_post(url, request.body)
-        ok = [True for r in res.values() if r['status'] == 'OK']
-
-        # Not acked by a quorum of writers
-        if len(ok) < ARGS.quorum:
-            return sanic.response.json(
-                dict(status='SERVICE_UNAVAILABLE', responses=res),
-                status=503)
-
-        # Write is successful
-        leader['seq'] += 1
-        WRITE_LEADERS[path] = leader
-        return sanic.response.json(dict(
-            status='OK', path=path, term=leader['term'],
-            seq=leader['seq']-1, length=len(request.body)))
-
-
-@APP.get('/blob/<path:path>/<term:int>/<seq:int>')
+@APP.get('/-/blob/<path:path>/<term:int>/<seq:int>')
 async def blob_read(request, path, term, seq):
     if os.path.isfile(abspath(path, term, seq)):
         with open(abspath(path, term, seq), 'rb') as fd:
@@ -192,7 +161,7 @@ async def blob_read(request, path, term, seq):
     return sanic.response.raw(b'', status=404)
 
 
-@APP.post('/paxos/<phase:str>/<path:path>/<term:int>')
+@APP.post('/-/paxos/<phase:str>/<path:path>/<term:int>')
 async def paxos_server(request, phase, path, term):
     term = int(term)
 
@@ -247,7 +216,44 @@ async def paxos_server(request, phase, path, term):
     return sanic.response.json(dict(status='OLD_SEQ'), status=400)
 
 
-@APP.get('/msgbox/<path:path>/<term:int>/<seq:int>')
+# Only client facing API after this
+@APP.get('/-/<path:path>')
+async def bad_path(request, path):
+    return sanic.response.text('Path must not start with a - char', status=400)
+
+
+@APP.post('/<path:path>')
+async def msgbox_post(request, path):
+    if path not in WRITE_LEADERS:
+        await elect(None, path)
+
+    async with WRITE_LOCKS.setdefault(path, asyncio.Lock()):
+        leader = WRITE_LEADERS.get(path, None)
+
+        if leader is None:
+            return sanic.response.text('NOT_A_LEADER\n', status=400)
+
+        try:
+            url = '-/blob/{}/{}/{}'.format(path, leader['term'], leader['seq'])
+            res = await Client.multi_post(url, request.body)
+            ok = [True for r in res.values() if r['status'] == 'OK']
+
+            if len(ok) >= ARGS.quorum:
+                leader['seq'] += 1
+                return sanic.response.text(
+                    '{}/{}/{}\n'.format(path, leader['term'], leader['seq']-1),
+                    headers={
+                        'x-msgbox-seq': leader['seq'] - 1,
+                        'x-msgbox-term': leader['term'],
+                        'x-msgbox-length': len(request.body)})
+        except Exception:
+            pass
+
+        WRITE_LEADERS.pop(path)
+        return sanic.response.text('SERVICE_UNAVAILABLE\n', status=503)
+
+
+@APP.get('/<path:path>/<term:int>/<seq:int>')
 async def paxos_client(request, path, term, seq):
     seq, term = int(seq), int(term)
 
@@ -256,7 +262,7 @@ async def paxos_client(request, path, term, seq):
         dict(closed=False, committed=-1))
 
     # Download from other nodes if we don't have it yet
-    url = 'blob/{}/{}/{}'.format(path, term, seq)
+    url = '-/blob/{}/{}/{}'.format(path, term, seq)
     for srv in ARGS.servers:
         if not os.path.isfile(abspath(path, term, seq)):
             res = await Client.get_blob('{}/{}'.format(srv, url))
@@ -269,7 +275,7 @@ async def paxos_client(request, path, term, seq):
 
         proposal = json.dumps(dict(proposal_seq=paxos_seq)).encode()
 
-        url = 'paxos/promise/{}/{}'.format(path, term)
+        url = '-/paxos/promise/{}/{}'.format(path, term)
         res = await Client.multi_post(url, proposal)
         for v in res.values():
             if 'LEARNED' == v['status']:
@@ -302,11 +308,11 @@ async def paxos_client(request, path, term, seq):
             proposal = dict(proposal_seq=paxos_seq, proposal_val=proposal[1])
             proposal = json.dumps(proposal).encode()
 
-            url = 'paxos/accept/{}/{}'.format(path, term)
+            url = '-/paxos/accept/{}/{}'.format(path, term)
             if ARGS.quorum > len(await Client.multi_post(url, proposal)):
                 return sanic.response.json('NO_ACCEPT_QUORUM', status=500)
 
-            url = 'paxos/learn/{}/{}'.format(path, term)
+            url = '-/paxos/learn/{}/{}'.format(path, term)
             if ARGS.quorum > len(await Client.multi_post(url, proposal)):
                 return sanic.response.json('NO_LEARN_QUORUM', status=500)
 
@@ -314,19 +320,49 @@ async def paxos_client(request, path, term, seq):
             term_state['closed'] = True
             term_state['committed'] = max_seq
 
-    # This term is closed.
-    # Requested seq number would never be there as the leader is gone.
-    # Redirect to first file in the next term
     if term_state['closed'] and seq > term_state['committed']:
-        return sanic.response.redirect('/msgbox/{}/{}/0'.format(path, term+1))
+        # This term is closed.
+        # Requested seq number would never be there as the leader is gone.
+        # Redirect to first file in the next term
+        blob, next_term, next_seq = b'', term+1, 0
 
-    # File with the request seq is not yet written. User should retry
-    if seq > term_state['committed']:
-        return sanic.response.json('OUT_OF_RANGE', status=400)
+    elif seq > term_state['committed']:
+        # File with the request seq is not yet written. User should retry
+        blob, next_term, next_seq = b'', term, seq
 
-    # We are good to return the file for this seq
-    with open(abspath(path, term, seq), 'rb') as fd:
-        return sanic.response.raw(fd.read())
+    else:
+        # We are good to return the file for this seq
+        with open(abspath(path, term, seq), 'rb') as fd:
+            blob, next_term, next_seq = fd.read(), term, seq+1
+
+    return sanic.response.raw(blob, headers={
+        'x-msgbox-seq': seq,
+        'x-msgbox-term': term,
+        'x-msgbox-next-seq': next_seq,
+        'x-msgbox-next-term': next_term,
+        'x-msgbox-committed-seq': term_state['committed']})
+
+
+@APP.get('/<path:path>')
+async def get_latest_value(request, path):
+    for srv in ARGS.servers:
+        res = await Client.get('{}/-/leader/{}'.format(srv, path))
+        if 200 == res['status']:
+            seq = res['json']['seq'] - 1
+            term = res['json']['term']
+            break
+
+    for term in range(term-1, -1, -1):
+        if seq > -1:
+            return await paxos_client(None, path, term+1, seq)
+
+        for srv in ARGS.servers:
+            url = '{}/{}/{}/999999999999999'.format(srv, path, term)
+            res = await Client.get_blob(url)
+
+            if 200 == res['status']:
+                seq = int(res['headers']['x-msgbox-committed-seq'])
+                break
 
 
 def allowed(request):
