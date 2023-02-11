@@ -63,10 +63,11 @@ async def vote(request, path, term):
 
     TERMS.pop(path, None)
 
-    if os.path.isdir(abspath(path, term)):
+    dirpath = abspath(path, term)
+    if os.path.isdir(dirpath):
         return sanic.response.json(dict(status='OLD_TERM'))
 
-    os.makedirs(abspath(path, term))
+    os.makedirs(dirpath)
     TERMS[path] = largest_filename(path)
 
     if term == TERMS[path]:
@@ -217,31 +218,32 @@ async def paxos_server(request, phase, path, term):
 
 
 # Only client facing API after this
-@APP.get('/-/<path:path>')
-async def bad_path(request, path):
+@APP.get('/-/<channel:path>')
+async def bad_channel(request, channel):
     return sanic.response.text('Path must not start with a - char', status=400)
 
 
-@APP.post('/<path:path>')
-async def msgbox_post(request, path):
-    if path not in WRITE_LEADERS:
-        await elect(None, path)
+@APP.post('/<channel:path>')
+async def append(request, channel):
+    if channel not in WRITE_LEADERS:
+        await elect(None, channel)
 
-    async with WRITE_LOCKS.setdefault(path, asyncio.Lock()):
-        leader = WRITE_LEADERS.get(path, None)
+    async with WRITE_LOCKS.setdefault(channel, asyncio.Lock()):
+        leader = WRITE_LEADERS.get(channel, None)
 
         if leader is None:
             return sanic.response.text('NOT_A_LEADER\n', status=400)
 
         try:
-            url = '-/blob/{}/{}/{}'.format(path, leader['term'], leader['seq'])
-            res = await Client.multi_post(url, request.body)
+            res = await Client.multi_post('-/blob/{}/{}/{}'.format(
+                channel, leader['term'], leader['seq']),
+                request.body)
             ok = [True for r in res.values() if r['status'] == 'OK']
 
             if len(ok) >= ARGS.quorum:
                 leader['seq'] += 1
-                return sanic.response.text(
-                    '{}/{}/{}\n'.format(path, leader['term'], leader['seq']-1),
+                return sanic.response.text('{}/{}/{}\n'.format(
+                    channel, leader['term'], leader['seq']-1),
                     headers={
                         'x-msgbox-seq': leader['seq'] - 1,
                         'x-msgbox-term': leader['term'],
@@ -249,7 +251,7 @@ async def msgbox_post(request, path):
         except Exception:
             pass
 
-        WRITE_LEADERS.pop(path)
+        WRITE_LEADERS.pop(channel)
         return sanic.response.text('SERVICE_UNAVAILABLE\n', status=503)
 
 
@@ -284,7 +286,7 @@ async def paxos_client(request, path, term, seq):
 
     if not term_state['closed'] and seq > term_state['committed']:
         if ARGS.quorum > len(res):
-            return sanic.response.json('NO_PROMISE_QUORUM', status=500)
+            return sanic.response.json('NO_PROMISE_QUORUM', status=503)
 
         max_seq = max([v['max_seq'] for v in res.values()])
         max_seq_set = set([v['max_seq'] for v in res.values()])
@@ -310,11 +312,11 @@ async def paxos_client(request, path, term, seq):
 
             url = '-/paxos/accept/{}/{}'.format(path, term)
             if ARGS.quorum > len(await Client.multi_post(url, proposal)):
-                return sanic.response.json('NO_ACCEPT_QUORUM', status=500)
+                return sanic.response.json('NO_ACCEPT_QUORUM', status=503)
 
             url = '-/paxos/learn/{}/{}'.format(path, term)
             if ARGS.quorum > len(await Client.multi_post(url, proposal)):
-                return sanic.response.json('NO_LEARN_QUORUM', status=500)
+                return sanic.response.json('NO_LEARN_QUORUM', status=503)
 
             # Paxos round completed. This is the new committed value
             term_state['closed'] = True
@@ -341,28 +343,6 @@ async def paxos_client(request, path, term, seq):
         'x-msgbox-next-seq': next_seq,
         'x-msgbox-next-term': next_term,
         'x-msgbox-committed-seq': term_state['committed']})
-
-
-@APP.get('/<path:path>')
-async def get_latest_value(request, path):
-    for srv in ARGS.servers:
-        res = await Client.get('{}/-/leader/{}'.format(srv, path))
-        if 200 == res['status']:
-            seq = res['json']['seq'] - 1
-            term = res['json']['term']
-            break
-
-    for term in range(term-1, -1, -1):
-        if seq > -1:
-            return await paxos_client(None, path, term+1, seq)
-
-        for srv in ARGS.servers:
-            url = '{}/{}/{}/999999999999999'.format(srv, path, term)
-            res = await Client.get_blob(url)
-
-            if 200 == res['status']:
-                seq = int(res['headers']['x-msgbox-committed-seq'])
-                break
 
 
 def allowed(request):

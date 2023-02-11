@@ -5,10 +5,10 @@ import hashlib
 import msgbox
 
 
-def main(conf_file, path, term, seq):
-    client = msgbox.Client(conf_file)
+def main(conf_file, channel, term, seq):
+    client = msgbox.Client(conf_file, channel)
 
-    for r in client.tail(path, term, seq):
+    for r in client.tail(term, seq):
         if not r.get('blob', None):
             json_dump = json.dumps(r, indent=4, sort_keys=True)
             sys.stderr.write(json_dump + '\n')
@@ -16,7 +16,7 @@ def main(conf_file, path, term, seq):
         else:
             sys.stdout.write('{} {} {}/{}/{}\n'.format(
                 hashlib.md5(r['blob']).hexdigest(), len(r['blob']),
-                r['path'], r['term'], r['seq']))
+                r['channel'], r['term'], r['seq']))
 
 
 if '__main__' == __name__:

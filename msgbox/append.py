@@ -3,12 +3,11 @@ import json
 import msgbox
 
 
-def main(conf_file, path, blob):
-    client = msgbox.Client(conf_file)
+def main(conf_file, channel, blob):
+    client = msgbox.Client(conf_file, channel)
+    result = client.append(blob)
 
-    result = client.append(path, blob)
-    json_dump = json.dumps(result, indent=4, sort_keys=True)
-    sys.stderr.write(json_dump + '\n')
+    sys.stderr.write(json.dumps(result, indent=4, sort_keys=True) + '\n')
 
 
 if '__main__' == __name__:

@@ -1,23 +1,29 @@
 import json
-import random
+import time
 import requests
 
 
 class Client:
-    def __init__(self, conf_file):
+    def __init__(self, conf_file, channel):
         with open(conf_file) as fd:
-            self.conf = json.load(fd)
+            self.servers = {s: 0 for s in json.load(fd)['servers']}
+            self.channel = channel
 
-    def tail(self, path, term, seq):
+    def tail(self, term, seq):
         while True:
-            srv = random.choice(self.conf['servers'])
-            url = '{}/{}/{}/{}'.format(srv, path, term, seq)
-            res = dict(server=srv, path=path, term=term, seq=seq)
+            srv = min([(v, k) for k, v in self.servers.items()])[1]
+            url = '{}/{}/{}/{}'.format(srv, self.channel, term, seq)
+            res = dict(server=srv, channel=self.channel, term=term, seq=seq)
             try:
+                t = time.time()
                 r = requests.get(url, allow_redirects=False)
+                if 200 != r.status_code:
+                    raise Exception('http_response : {}'.format(r.status_code))
+
+                self.servers[srv] = int((time.time() - t)*1000)
 
                 res.update(dict(
-                    path=path, blob=r.content,
+                    channel=self.channel, blob=r.content,
                     next_seq=r.headers['x-msgbox-next-seq'],
                     next_term=r.headers['x-msgbox-next-term'],
                     committed_seq=r.headers['x-msgbox-committed-seq']))
@@ -27,42 +33,31 @@ class Client:
 
                 seq = r.headers['x-msgbox-next-seq']
                 term = r.headers['x-msgbox-next-term']
+            except requests.exceptions.ConnectionError:
+                self.servers[srv] = 10*10
+                time.sleep(1)
             except Exception as e:
-                res.update(dict(exception=str(type(e))))
+                self.servers[srv] = 10*10
+                res.update(dict(exception=str(e)))
                 yield res
 
-    def get(self, path):
-        for srv in self.conf['servers']:
-            url = '{}/{}'.format(srv, path)
+    def append(self, blob):
+        for i in range(len(self.servers)):
+            srv = min([(v, k) for k, v in self.servers.items()])[1]
+            url = '{}/{}'.format(srv, self.channel)
 
             try:
-                r = requests.get(url)
-                if 200 == r.status_code:
-                    return dict(
-                        path=path, blob=r.content,
-                        seq=r.headers['x-msgbox-seq'],
-                        term=r.headers['x-msgbox-term'],
-                        next_seq=r.headers['x-msgbox-next-seq'],
-                        next_term=r.headers['x-msgbox-next-term'],
-                        committed_seq=r.headers['x-msgbox-committed-seq'])
-            except Exception:
-                pass
-
-        return 'Service Unavailable'
-
-    def append(self, path, blob):
-        for srv in self.conf['servers']:
-            url = '{}/{}'.format(srv, path)
-
-            try:
+                t = time.time()
                 r = requests.post(url, data=blob)
+                self.servers[srv] = int((time.time() - t)*1000)
+
                 if 200 == r.status_code:
                     return dict(
-                        path=path,
+                        channel=self.channel,
+                        srv=srv,
+                        msec=self.servers[srv],
                         seq=r.headers['x-msgbox-seq'],
                         term=r.headers['x-msgbox-term'],
                         length=r.headers['x-msgbox-length'])
             except Exception:
-                pass
-
-        return 'Service Unavailable'
+                self.servers[srv] = 10*10
