@@ -11,13 +11,12 @@ import argparse
 
 
 APP = sanic.Sanic('MsgBox')
-start_time = time.strftime('%y%m%d-%H%M%S')
 signal.alarm(random.randint(1, 10))
 
-TERMS = dict()
-READER_INFO = dict()
-WRITE_LOCKS = dict()
-WRITE_LEADERS = dict()
+
+class G:
+    max_seq = None
+    start_time = time.strftime('%y%m%d-%H%M%S')
 
 
 # All files and directory should be in the assigned location
@@ -26,24 +25,23 @@ def abspath(*args):
     return os.path.join(os.getcwd(), 'data', *args)
 
 
-# Largest filename in a dir
-def largest_filename(path):
-    path = abspath(path)
+# Form a hierarchical path to avoid too many files in a directory
+def seq2path(seq):
+    batch_size = 10**2
 
-    filenames = list()
-    if os.path.isdir(path):
-        filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
+    filename = seq % batch_size
 
-    return max(filenames) if filenames else -1
+    one = int(seq / batch_size) % batch_size
+    two = int(seq / batch_size**2) % batch_size
+    three = int(seq / batch_size**3) % batch_size
+
+    return abspath(str(three), str(two), str(one), str(filename))
 
 
 # Atomic file creation. Write a tmp file and then move to final path
-def blob_dump(path, term, seq, blob):
-    term_dir = abspath(path, term)
-    if not os.path.isdir(term_dir):
-        os.makedirs(term_dir)
+def blob_dump(path, blob):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    path = abspath(path, term, seq)
     tmppath = '{}-{}.tmp'.format(path, uuid.uuid4())
 
     with open(tmppath, 'wb') as fd:
@@ -52,140 +50,64 @@ def blob_dump(path, term, seq, blob):
     os.rename(tmppath, path)
 
 
-# We vote only once for a term in our lifetime
-# Agree if and only if this term is biggest seen so far
-@APP.get('/-/vote/<path:path>/<term:int>')
-async def vote(request, path, term):
-    term = int(term)
-
+@APP.post('/<seq:int>')
+async def write(request, seq):
     if not allowed(request):
-        return sanic.response.json('Unauthorized', status=401)
+        raise sanic.exception.Unauthorized()
 
-    TERMS.pop(path, None)
+    if seq > G.max_seq:
+        G.max_seq = seq
 
-    dirpath = abspath(path, term)
-    if os.path.isdir(dirpath):
-        return sanic.response.json(dict(status='OLD_TERM'))
+    filepath = seq2path(int(seq))
 
-    os.makedirs(dirpath)
-    TERMS[path] = largest_filename(path)
+    if not os.path.isfile(filepath):
+        blob_dump('{}.blob'.format(filepath), request.body)
+        blob_dump(filepath, json.dumps(dict(
+            promised_seq=1, accepted_seq=1,
+            accepted_val=True), indent=4).encode())
 
-    if term == TERMS[path]:
         return sanic.response.json(dict(status='OK'))
 
-    return sanic.response.json(dict(status='OBSOLETED'))
+    raise sanic.exception.Forbidden()
 
 
-@APP.get('/-/info/<path:path>')
-async def path_info(request, path):
-    TERMS[path] = largest_filename(path)
+@APP.post('/')
+async def append(request):
+    n = len(ARGS.servers)
+    seq = int((G.max_seq+n)/n)*n + ARGS.index
+    G.max_seq = seq
 
-    return sanic.response.json(dict(
-        path=path,
-        term=TERMS[path],
-        leader=WRITE_LEADERS.get(path, None)))
+    res = await Client.multi_post('{}'.format(seq), request.body)
+    ok = [True for r in res.values() if r['status'] == 'OK']
 
+    if len(ok) >= ARGS.quorum:
+        return sanic.response.json(seq, headers={
+            'x-msgbox-seq': seq,
+            'x-msgbox-length': len(request.body)})
 
-@APP.get('/-/leader/<path:path>')
-async def elect(request, path):
-    for i in range(2):
-        # Lets find if we have an active leader
-        res = await Client.multi_get('-/info/{}'.format(path))
-
-        # Found a leader. Could be from an older term though.
-        # Even if it is from an older term, we are safe as
-        # any writes through this would fail.
-        for k, v in res.items():
-            if v['leader'] is not None:
-                return sanic.response.json(dict(
-                    path=path, leader=k,
-                    term=v['leader']['term'],
-                    seq=v['leader']['seq'],
-                    responses=res))
-
-        # Leader not found. Lets find the max term handled so far
-        # Can't conclude anything without hearing from a majority
-        if len(res) < ARGS.quorum:
-            break
-
-        # Lets solicit vote for this node as the leader for the next term
-        term = max([r['term'] for r in res.values()])
-        res = await Client.multi_get('-/vote/{}/{}'.format(path, term+1))
-
-        votes = [True for r in res.values() if 'OK' == r['status']]
-
-        # A Majority did not vote for us. This term is abandoned
-        if len(votes) < ARGS.quorum:
-            break
-
-        # This node got votes from a majority. Lets mark it as the leader
-        abspath = os.path.join(os.getcwd(), 'audit', 'leader')
-        if not os.path.isdir(abspath):
-            os.makedirs(abspath)
-
-        with open(os.path.join(abspath, start_time), 'a') as fd:
-            fd.write('{}/{}\n'.format(path, term+1))
-
-        WRITE_LEADERS[path] = dict(term=term+1, seq=0)
-
-    return sanic.response.json(
-        dict(status='SERVICE_UNAVAILABLE', leader=None),
-        status=503)
+    raise sanic.exceptions.ServiceUnavailable()
 
 
-# Write a new blob. Invalidate the cached term if this one is larger
-@APP.post('/-/blob/<path:path>/<term:int>/<seq:int>')
-async def blob_write(request, path, term, seq):
-    term, seq = int(term), int(seq)
-
+@APP.post('/paxos/<phase:str>/<seq:int>')
+def paxos_server(request, phase, seq):
     if not allowed(request):
-        return sanic.response.json('Unauthorized', status=401)
+        raise sanic.exception.Unauthorized()
 
-    if path not in TERMS:
-        TERMS[path] = largest_filename(path)
+    paxos = dict(promised_seq=0, accepted_seq=0, accepted_val=None)
 
-    if term < TERMS[path]:
-        return sanic.response.json(dict(status='OLD_TERM'))
-
-    blob_dump(path, term, seq, request.body)
-    TERMS[path] = term
-
-    return sanic.response.json(dict(status='OK'))
-
-
-@APP.get('/-/blob/<path:path>/<term:int>/<seq:int>')
-async def blob_read(request, path, term, seq):
-    if os.path.isfile(abspath(path, term, seq)):
-        with open(abspath(path, term, seq), 'rb') as fd:
-            return sanic.response.raw(fd.read())
-
-    return sanic.response.raw(b'', status=404)
-
-
-@APP.post('/-/paxos/<phase:str>/<path:path>/<term:int>')
-async def paxos_server(request, phase, path, term):
-    term = int(term)
-
-    if os.path.isfile(abspath(path, term, 'paxos')):
-        with open(abspath(path, term, 'paxos')) as fd:
+    filepath = seq2path(seq)
+    if os.path.isfile(filepath):
+        with open(filepath) as fd:
             paxos = json.loads(fd.read())
-    else:
-        paxos = dict(promised_seq=0, accepted_seq=0, accepted_val=None)
 
     if 'learned_val' in paxos:
-        return sanic.response.json(dict(
-            status='LEARNED',
-            learned_val=paxos['learned_val']))
-
-    if term >= largest_filename(abspath(path)):
-        return sanic.response.json(dict(
-            status='STILL_FOLLOWING_THE_OLD_LEADER',
-            max_seq=largest_filename(abspath(path, term))))
+        return sanic.response.json(
+            dict(status='LEARNED', learned_val=paxos['learned_val']))
 
     request = request.json
 
     if 'promise' == phase and request['proposal_seq'] > paxos['promised_seq']:
-        blob_dump(path, term, 'paxos', json.dumps(dict(
+        blob_dump(filepath, json.dumps(dict(
             promised_seq=request['proposal_seq'],
             accepted_seq=paxos['accepted_seq'],
             accepted_val=paxos['accepted_val']), indent=4).encode())
@@ -193,12 +115,10 @@ async def paxos_server(request, phase, path, term):
         return sanic.response.json(dict(
             status='OK',
             accepted_seq=paxos['accepted_seq'],
-            accepted_val=paxos['accepted_val'],
-            # This is not part of paxos. Just piggyback to avoid another call.
-            max_seq=largest_filename(abspath(path, term))))
+            accepted_val=paxos['accepted_val']))
 
     if 'accept' == phase and request['proposal_seq'] >= paxos['promised_seq']:
-        blob_dump(path, term, 'paxos', json.dumps(dict(
+        blob_dump(filepath, json.dumps(dict(
             promised_seq=request['proposal_seq'],
             accepted_seq=request['proposal_seq'],
             accepted_val=request['proposal_val']), indent=4).encode())
@@ -206,7 +126,7 @@ async def paxos_server(request, phase, path, term):
         return sanic.response.json(dict(status='OK'))
 
     if 'learn' == phase and request['proposal_seq'] >= paxos['promised_seq']:
-        blob_dump(path, term, 'paxos', json.dumps(dict(
+        blob_dump(filepath, json.dumps(dict(
             promised_seq=request['proposal_seq'],
             accepted_seq=request['proposal_seq'],
             accepted_val=request['proposal_val'],
@@ -214,135 +134,79 @@ async def paxos_server(request, phase, path, term):
 
         return sanic.response.json(dict(status='OK'))
 
-    return sanic.response.json(dict(status='OLD_SEQ'), status=400)
+    return sanic.response.json(dict(status=None))
 
 
-# Only client facing API after this
-@APP.get('/-/<channel:path>')
-async def bad_channel(request, channel):
-    return sanic.response.text('Path must not start with a - char', status=400)
+@APP.get('/blob/<seq:int>')
+async def blob_read(request, seq):
+    filepath = '{}.blob'.format(seq2path(seq))
+
+    if os.path.isfile(filepath):
+        with open(filepath, 'rb') as fd:
+            return sanic.response.raw(fd.read())
+
+    return sanic.response.text('NOT_FOUND', status=404)
 
 
-@APP.post('/<channel:path>')
-async def append(request, channel):
-    if channel not in WRITE_LEADERS:
-        await elect(None, channel)
+@APP.get('/<seq:int>')
+async def paxos_client(request, seq):
+    seq = int(seq)
 
-    async with WRITE_LOCKS.setdefault(channel, asyncio.Lock()):
-        leader = WRITE_LEADERS.get(channel, None)
+    if seq > G.max_seq:
+        await asyncio.sleep(1)
+        raise sanic.exceptions.NotFound()
 
-        if leader is None:
-            return sanic.response.text('NOT_A_LEADER\n', status=400)
+    paxos = dict()
+    paxospath = seq2path(seq)
+    if os.path.isfile(paxospath):
+        with open(paxospath) as fd:
+            paxos = json.load(fd)
 
-        try:
-            res = await Client.multi_post('-/blob/{}/{}/{}'.format(
-                channel, leader['term'], leader['seq']),
-                request.body)
-            ok = [True for r in res.values() if r['status'] == 'OK']
+    if 'learned_val' not in paxos or paxos['learned_val'] is True:
+        # Fetch file from other nodes if this node does not have yet
+        blobpath = '{}.blob'.format(paxospath)
+        for srv in ARGS.servers:
+            if not os.path.isfile(blobpath):
+                res = await Client.get_blob('{}/blob/{}'.format(srv, seq))
+                if 200 == res['status']:
+                    blob_dump(blobpath, res['blob'])
 
-            if len(ok) >= ARGS.quorum:
-                leader['seq'] += 1
-                return sanic.response.text('{}/{}/{}\n'.format(
-                    channel, leader['term'], leader['seq']-1),
-                    headers={
-                        'x-msgbox-seq': leader['seq'] - 1,
-                        'x-msgbox-term': leader['term'],
-                        'x-msgbox-length': len(request.body)})
-        except Exception:
-            pass
-
-        WRITE_LEADERS.pop(channel)
-        return sanic.response.text('SERVICE_UNAVAILABLE\n', status=503)
-
-
-@APP.get('/<path:path>/<term:int>/<seq:int>')
-async def paxos_client(request, path, term, seq):
-    seq, term = int(seq), int(term)
-
-    term_state = READER_INFO.setdefault(
-        (path, term),
-        dict(closed=False, committed=-1))
-
-    # Download from other nodes if we don't have it yet
-    url = '-/blob/{}/{}/{}'.format(path, term, seq)
-    for srv in ARGS.servers:
-        if not os.path.isfile(abspath(path, term, seq)):
-            res = await Client.get_blob('{}/{}'.format(srv, url))
-
-            if 200 == res['status']:
-                blob_dump(path, term, seq, res['blob'])
-
-    if not term_state['closed'] and seq > term_state['committed']:
+    if 'learned_val' not in paxos:
         paxos_seq = int(time.time()*10**6)
-
         proposal = json.dumps(dict(proposal_seq=paxos_seq)).encode()
-
-        url = '-/paxos/promise/{}/{}'.format(path, term)
-        res = await Client.multi_post(url, proposal)
-        for v in res.values():
-            if 'LEARNED' == v['status']:
-                term_state['closed'] = True
-                term_state['committed'] = v['learned_val']
-
-    if not term_state['closed'] and seq > term_state['committed']:
-        if ARGS.quorum > len(res):
-            return sanic.response.json('NO_PROMISE_QUORUM', status=503)
-
-        max_seq = max([v['max_seq'] for v in res.values()])
-        max_seq_set = set([v['max_seq'] for v in res.values()])
-
+        res = await Client.multi_post('paxos/promise/{}'.format(seq), proposal)
         res = [v for v in res.values() if 'OK' == v['status']]
-        if 1 == len(max_seq_set):
-            term_state['committed'] = max_seq
-        else:
-            term_state['committed'] = max_seq - 1
+        if ARGS.quorum > len(res):
+            return sanic.response.text('NO_PROMISE_QUORUM', status=503)
 
-    # There is already a new leader and this term is obsolete
-    # At least a majority of nodes have the same max seq for this term
-    # This term can be safely finalized with the above seq as the final file
-    if not term_state['closed'] and seq > term_state['committed']:
-        if len([True for v in res if max_seq == v['max_seq']]) >= ARGS.quorum:
-            proposal = (0, max_seq)
-            for val in res:
-                if val['accepted_seq'] > proposal[0]:
-                    proposal = (val['accepted_seq'], val['accepted_val'])
+        proposal = (0, False)
+        for v in res:
+            if v['accepted_seq'] > proposal[0]:
+                proposal = (v['accepted_seq'], v['accepted_val'])
 
-            proposal = dict(proposal_seq=paxos_seq, proposal_val=proposal[1])
-            proposal = json.dumps(proposal).encode()
+        print(proposal)
+        proposed_val = proposal[1]
+        proposal = dict(proposal_seq=paxos_seq, proposal_val=proposal[1])
+        proposal = json.dumps(proposal).encode()
 
-            url = '-/paxos/accept/{}/{}'.format(path, term)
-            if ARGS.quorum > len(await Client.multi_post(url, proposal)):
-                return sanic.response.json('NO_ACCEPT_QUORUM', status=503)
+        res = await Client.multi_post('paxos/accept/{}'.format(seq), proposal)
+        if ARGS.quorum > len([v for v in res.values() if 'OK' == v['status']]):
+            return sanic.response.text('NO_ACCEPT_QUORUM', status=503)
 
-            url = '-/paxos/learn/{}/{}'.format(path, term)
-            if ARGS.quorum > len(await Client.multi_post(url, proposal)):
-                return sanic.response.json('NO_LEARN_QUORUM', status=503)
+        res = await Client.multi_post('paxos/learn/{}'.format(seq), proposal)
+        if ARGS.quorum > len([v for v in res.values() if 'OK' == v['status']]):
+            return sanic.response.text('NO_LEARN_QUORUM', status=503)
 
-            # Paxos round completed. This is the new committed value
-            term_state['closed'] = True
-            term_state['committed'] = max_seq
+        paxos['learned_val'] = proposed_val
 
-    if term_state['closed'] and seq > term_state['committed']:
-        # This term is closed.
-        # Requested seq number would never be there as the leader is gone.
-        # Redirect to first file in the next term
-        blob, next_term, next_seq = b'', term+1, 0
+    if paxos['learned_val'] is False:
+        return sanic.response.raw(b'', headers={'x-msgbox-seq': seq})
 
-    elif seq > term_state['committed']:
-        # File with the request seq is not yet written. User should retry
-        blob, next_term, next_seq = b'', term, seq
+    if paxos['learned_val'] is True and os.path.isfile(blobpath):
+        with open(blobpath, 'rb') as fd:
+            return sanic.response.raw(fd.read(), headers={'x-msgbox-seq': seq})
 
-    else:
-        # We are good to return the file for this seq
-        with open(abspath(path, term, seq), 'rb') as fd:
-            blob, next_term, next_seq = fd.read(), term, seq+1
-
-    return sanic.response.raw(blob, headers={
-        'x-msgbox-seq': seq,
-        'x-msgbox-term': term,
-        'x-msgbox-next-seq': next_seq,
-        'x-msgbox-next-term': next_term,
-        'x-msgbox-committed-seq': term_state['committed']})
+    return sanic.exceptions.SanicException('RETRY')
 
 
 def allowed(request):
@@ -367,9 +231,12 @@ class Client:
     @classmethod
     async def get_blob(self, url):
         async with aiohttp.ClientSession(headers=self.headers) as s:
-            async with s.get(url, ssl=False) as r:
-                return dict(status=r.status, headers=r.headers,
-                            blob=await r.read())
+            try:
+                async with s.get(url, ssl=False) as r:
+                    return dict(status=r.status, headers=r.headers,
+                                blob=await r.read())
+            except Exception:
+                return dict(status=500)
 
     @classmethod
     async def multi_get(self, url):
@@ -409,6 +276,7 @@ class Client:
 if '__main__' == __name__:
     ARGS = argparse.ArgumentParser()
     ARGS.add_argument('--port', dest='port', type=int)
+    ARGS.add_argument('--index', dest='index', type=int)
     ARGS.add_argument('--conf', dest='conf', default='config.json')
     ARGS = ARGS.parse_args()
 
@@ -419,5 +287,22 @@ if '__main__' == __name__:
     ARGS.servers = config['servers']
     ARGS.quorum = int(len(ARGS.servers)/2) + 1
     Client.headers = {'x-auth-key': ARGS.auth_key}
+
+    # Find the maximum seq written so far
+    path = 'data'
+    os.makedirs(path, exist_ok=True)
+    for i in range(3):
+        filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
+        if filenames:
+            path = os.path.join(path, str(max(filenames)))
+        else:
+            path = os.path.join(path, '0')
+            os.makedirs(path)
+
+    filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
+    path = os.path.join(path, str(max(filenames) if filenames else 0))
+    G.max_seq = 0
+    for p in path.split('/')[1:]:
+        G.max_seq = G.max_seq*10**2 + int(p)
 
     APP.run(port=ARGS.port, single_process=True, access_log=True)

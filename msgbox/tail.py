@@ -1,23 +1,16 @@
 import sys
-import json
-import time
 import hashlib
 import msgbox
 
 
-def main(conf_file, channel, term, seq):
-    client = msgbox.Client(conf_file, channel)
+def main(conf_file, seq):
+    client = msgbox.Client(conf_file)
 
-    for r in client.tail(term, seq):
-        if not r.get('blob', None):
-            json_dump = json.dumps(r, indent=4, sort_keys=True)
-            sys.stderr.write(json_dump + '\n')
-            time.sleep(1)
-        else:
-            sys.stdout.write('{} {} {}/{}/{}\n'.format(
-                hashlib.md5(r['blob']).hexdigest(), len(r['blob']),
-                r['channel'], r['term'], r['seq']))
+    for r in client.tail(seq):
+        blob = r.pop('blob', b'')
+        sys.stdout.write('{} {} {}\n'.format(
+            hashlib.md5(blob).hexdigest(), r['seq'], len(blob)))
 
 
 if '__main__' == __name__:
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
+    main(sys.argv[1], int(sys.argv[2]))
