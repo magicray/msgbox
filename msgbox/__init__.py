@@ -1,13 +1,11 @@
-import json
 import time
 import random
 import requests
 
 
 class Client:
-    def __init__(self, conf_file):
-        with open(conf_file) as fd:
-            self.servers = json.load(fd)['servers']
+    def __init__(self, servers):
+        self.servers = servers
 
     def tail(self, seq):
         while True:
@@ -43,6 +41,7 @@ class Client:
                         srv=srv,
                         msec=msec,
                         seq=r.headers['x-msgbox-seq'],
+                        # chksum=r.headers['x-msgbox-chksum'],
                         length=r.headers['x-msgbox-length'])
             except Exception:
                 pass

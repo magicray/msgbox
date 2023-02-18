@@ -3,8 +3,8 @@ import hashlib
 import msgbox
 
 
-def main(conf_file, seq):
-    client = msgbox.Client(conf_file)
+def main(servers, seq):
+    client = msgbox.Client(servers)
 
     for r in client.tail(seq):
         blob = r.pop('blob', b'')
@@ -13,4 +13,4 @@ def main(conf_file, seq):
 
 
 if '__main__' == __name__:
-    main(sys.argv[1], int(sys.argv[2]))
+    main(sys.argv[1].split(','), int(sys.argv[2]))
