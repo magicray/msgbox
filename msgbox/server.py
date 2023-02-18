@@ -10,7 +10,7 @@ import aiohttp
 import argparse
 
 
-APP = sanic.Sanic('LogDB')
+APP = sanic.Sanic('logdb')
 signal.alarm(random.randint(1, 5))
 
 
@@ -228,13 +228,6 @@ def allowed(request):
 
 class Client:
     @classmethod
-    async def get(self, url):
-        async with aiohttp.ClientSession(headers=self.headers) as s:
-            async with s.get(url, ssl=False) as r:
-                return dict(status=r.status, headers=r.headers,
-                            json=await r.json())
-
-    @classmethod
     async def get_blob(self, url):
         async with aiohttp.ClientSession(headers=self.headers) as s:
             try:
@@ -245,20 +238,14 @@ class Client:
                 return dict(status=500)
 
     @classmethod
-    async def multi_get(self, url):
-        responses = await asyncio.gather(*[
-            asyncio.ensure_future(
-                self.get('{}/{}'.format(s, url))) for s in ARGS.servers],
-            return_exceptions=True)
-
-        return self.combine_result(ARGS.servers, responses)
-
-    @classmethod
     async def post(self, url, data):
         async with aiohttp.ClientSession(headers=self.headers) as s:
-            async with s.post(url, data=data, ssl=False) as r:
-                return dict(status=r.status, headers=r.headers,
-                            json=await r.json())
+            try:
+                async with s.post(url, data=data, ssl=False) as r:
+                    return dict(status=r.status, headers=r.headers,
+                                json=await r.json())
+            except Exception:
+                return dict(status=500)
 
     @classmethod
     async def multi_post(self, url, data):
@@ -268,12 +255,8 @@ class Client:
             for s in ARGS.servers],
             return_exceptions=True)
 
-        return self.combine_result(ARGS.servers, responses)
-
-    @classmethod
-    def combine_result(self, urls, responses):
         result = dict()
-        for s, r in zip(urls, responses):
+        for s, r in zip(ARGS.servers, responses):
             if type(r) is dict and 200 == r['status']:
                 result[s] = r['json']
         return result

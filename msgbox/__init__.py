@@ -37,11 +37,8 @@ class Client:
                 msec = int((time.time() - t)*1000)
 
                 if 200 == r.status_code:
-                    return dict(
-                        srv=srv,
-                        msec=msec,
-                        seq=r.headers['x-msgbox-seq'],
-                        # chksum=r.headers['x-msgbox-chksum'],
-                        length=r.headers['x-msgbox-length'])
+                    return dict(srv=srv, msec=msec,
+                                seq=r.headers['x-msgbox-seq'],
+                                length=r.headers['x-msgbox-length'])
             except Exception:
                 pass
