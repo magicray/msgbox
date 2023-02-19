@@ -14,9 +14,9 @@ APP = sanic.Sanic('logdb')
 signal.alarm(random.randint(1, 5))
 
 
+# Global variables
 class G:
     max_seq = None
-    start_time = time.strftime('%y%m%d-%H%M%S')
 
 
 # Form a hierarchical path to avoid too many files in a directory
@@ -30,7 +30,7 @@ def seq2path(seq):
     return os.path.join('data', str(three), str(two), str(one), str(seq))
 
 
-# Atomic file creation. Write a tmp file and then move to final path
+# Failsafe file creation. Write a tmp file and then move to final path
 def blob_dump(path, blob):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -42,8 +42,12 @@ def blob_dump(path, blob):
     os.rename(tmppath, path)
 
 
+def json_dump(path, obj):
+    blob_dump(path, json.dumps(obj, indent=4).encode())
+
+
 # Write the blob with a unique filename
-# Simulate a paxos accept request
+# and then simulate a paxos accept request
 @APP.post('/<seq:int>/<uuid:str>')
 async def dump(request, seq, uuid):
     seq = int(seq)
@@ -64,7 +68,7 @@ async def dump(request, seq, uuid):
 
 
 # If a majority replies, our accept request for this seq is successful
-# On the read side, all paxos rounds, would be run to finalize the write
+# On the read side all paxos rounds would be run to finalize the write
 @APP.post('/')
 async def append(request):
     n = len(ARGS.servers)
@@ -101,16 +105,16 @@ async def paxos_server(request, phase, seq):
     if 'learned_val' in paxos:
         return sanic.response.json(dict(
             status='OK',
-            accepted_seq=10**15-1,
+            accepted_seq=10**15,
             accepted_val=paxos['learned_val']))
 
     request = request.json
 
     if 'promise' == phase and request['proposal_seq'] > paxos['promised_seq']:
-        blob_dump(filepath, json.dumps(dict(
+        json_dump(filepath, dict(
             promised_seq=request['proposal_seq'],
             accepted_seq=paxos['accepted_seq'],
-            accepted_val=paxos['accepted_val']), indent=4).encode())
+            accepted_val=paxos['accepted_val']))
 
         return sanic.response.json(dict(
             status='OK',
@@ -131,16 +135,15 @@ async def paxos_server(request, phase, seq):
             return sanic.response.json(dict(status='BLOB_NOT_FOUND'))
 
     if 'accept' == phase and request['proposal_seq'] >= paxos['promised_seq']:
-        blob_dump(filepath, json.dumps(dict(
+        json_dump(filepath, dict(
             promised_seq=request['proposal_seq'],
             accepted_seq=request['proposal_seq'],
-            accepted_val=request['proposal_val']), indent=4).encode())
+            accepted_val=request['proposal_val']))
 
         return sanic.response.json(dict(status='OK'))
 
     if 'learn' == phase and request['proposal_seq'] >= paxos['promised_seq']:
-        blob_dump(filepath, json.dumps(dict(
-            learned_val=request['proposal_val']), indent=4).encode())
+        json_dump(filepath, dict(learned_val=request['proposal_val']))
 
         return sanic.response.json(dict(status='OK'))
 
