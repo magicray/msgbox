@@ -13,7 +13,7 @@ import argparse
 
 
 APP = sanic.Sanic('logdb')
-signal.alarm(random.randint(1, 10))
+signal.alarm(random.randint(1, 5))
 
 
 # Global variables
@@ -22,11 +22,17 @@ class G:
     session = None
 
 
+def allowed(request):
+    if ARGS.auth_key == request.headers.get('x-auth-key', None):
+        return True
+
+
 @APP.post('/next/seq')
 async def next_seq(request):
-    if not allowed(request):
+    if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
+    G.max_seq += 1
     return sanic.response.raw(pickle.dumps(G.max_seq))
 
 
@@ -34,7 +40,7 @@ async def next_seq(request):
 async def paxos_server(request, phase, proposal_seq, key):
     proposal_seq = int(proposal_seq)
 
-    if not allowed(request):
+    if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
     os.makedirs(os.path.dirname(key), exist_ok=True)
@@ -118,11 +124,11 @@ async def paxos_client(key, value):
 def seq2path(seq):
     batch_size = ARGS.batch
 
-    one = int(seq / batch_size) % batch_size
-    two = int(seq / batch_size**2) % batch_size
-    three = int(seq / batch_size**3) % batch_size
+    one = str(int(seq / batch_size) % batch_size)
+    two = str(int(seq / batch_size**2) % batch_size)
+    three = str(int(seq / batch_size**3) % batch_size)
 
-    return os.path.join('data', str(three), str(two), str(one), str(seq))
+    return os.path.join('data', 'log', three, two, one, str(seq))
 
 
 @APP.post('/')
@@ -131,12 +137,9 @@ async def append(request):
     if ARGS.quorum > len(res):
         return 'NO_QUORUM'
 
-    seq = max([pickle.loads(body) for body in res.values()]) + 1
-    G.max_seq = seq
+    seq = max([pickle.loads(body) for body in res.values()])
 
-    status = await paxos_client(seq2path(seq), request.body)
-
-    if 'OK' == status:
+    if 'OK' == await paxos_client(seq2path(seq), request.body):
         return sanic.response.json(seq, headers={
             'x-logdb-seq': seq,
             'x-logdb-length': len(request.body)})
@@ -166,15 +169,23 @@ async def tail(request, seq):
         await paxos_client(key, b'')
 
 
-def allowed(request):
-    auth_key = request.headers.get('x-auth-key', None)
-    if not auth_key:
-        return False
+@APP.put('/<key:path>/<version:int>')
+async def put(request, key, version):
+    version = int(version)
 
-    if auth_key == ARGS.auth_key:
-        return True
+    key = os.path.join('data', 'kv', key, str(version))
+    status = await paxos_client(key, request.body)
 
-    return False
+    return sanic.response.json(status, headers={
+        'x-logdb-length': len(request.body)})
+
+
+@APP.get('/<key:path>')
+async def get(request, key):
+    key = os.path.join('data', 'kv', key)
+
+    return sanic.response.json(key, headers={
+        'x-logdb-length': len(request.body)})
 
 
 if '__main__' == __name__:
@@ -193,9 +204,11 @@ if '__main__' == __name__:
     ARGS.quorum = max(ARGS.quorum, int(len(ARGS.servers)/2) + 1)
     G.auth_header = {'x-auth-key': ARGS.auth_key}
 
-    # Find the maximum seq written so far
-    path = 'data'
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(os.path.join('data', 'kv'), exist_ok=True)
+    os.makedirs(os.path.join('data', 'log'), exist_ok=True)
+
+    # Find the maximum log seq written so far
+    path = os.path.join('data', 'log')
     for i in range(3):
         filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
         if filenames:

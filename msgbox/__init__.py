@@ -35,3 +35,15 @@ class Client:
                                 length=r.headers['x-logdb-length'])
             except Exception:
                 pass
+
+    def put(self, key, value):
+        for i in range(len(self.servers)):
+            srv = random.choice(self.servers)
+
+            try:
+                r = requests.put('{}/{}'.format(srv, key), data=value)
+                if 200 == r.status_code:
+                    return dict(srv=srv, status=r.json(),
+                                length=r.headers['x-logdb-length'])
+            except Exception:
+                pass
