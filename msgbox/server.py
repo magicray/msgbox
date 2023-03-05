@@ -4,6 +4,8 @@ import json
 import uuid
 import sanic
 import signal
+import struct
+import pickle
 import random
 import asyncio
 import aiohttp
@@ -11,12 +13,105 @@ import argparse
 
 
 APP = sanic.Sanic('logdb')
-signal.alarm(random.randint(1, 5))
+signal.alarm(random.randint(1, 10))
 
 
 # Global variables
 class G:
     max_seq = None
+    session = None
+
+
+@APP.post('/next/seq')
+async def next_seq(request):
+    if not allowed(request):
+        raise sanic.exceptions.Unauthorized('Unauthorized Request')
+
+    return sanic.response.raw(pickle.dumps(G.max_seq))
+
+
+@APP.post('/<phase:str>/<proposal_seq:int>/<key:path>')
+async def paxos_server(request, phase, proposal_seq, key):
+    proposal_seq = int(proposal_seq)
+
+    if not allowed(request):
+        raise sanic.exceptions.Unauthorized('Unauthorized Request')
+
+    os.makedirs(os.path.dirname(key), exist_ok=True)
+
+    promised_seq, accepted_seq = 0, 0
+    if os.path.isfile(key):
+        with open(key, 'rb') as fd:
+            promised_seq, accepted_seq = struct.unpack('!II', fd.read(8))
+
+            if 0 == promised_seq and 0 == accepted_seq:
+                return sanic.response.raw(pickle.dumps([10**15, fd.read()]))
+
+    if 'promise' == phase and proposal_seq > promised_seq:
+        mode = 'r+b' if os.path.isfile(key) else 'w+b'
+
+        with open(key, mode) as fd:
+            fd.write(struct.pack('!II', proposal_seq, accepted_seq))
+
+            return sanic.response.raw(pickle.dumps([accepted_seq, fd.read()]))
+
+    if 'accept' == phase and proposal_seq == promised_seq:
+        tmpfile = '{}-{}.tmp'.format(key, uuid.uuid4())
+        with open(tmpfile, 'wb') as fd:
+            fd.write(struct.pack('!II', proposal_seq, proposal_seq))
+            fd.write(request.body)
+        os.rename(tmpfile, key)
+
+        return sanic.response.raw(b'OK')
+
+    if 'learn' == phase and proposal_seq == promised_seq:
+        with open(key, 'r+b') as fd:
+            fd.write(struct.pack('!II', 0, 0))
+
+        return sanic.response.raw(b'OK')
+
+
+async def rpc(url, blob=None):
+    if G.session is None:
+        G.session = aiohttp.ClientSession(headers=G.auth_header)
+
+    responses = await asyncio.gather(
+        *[asyncio.ensure_future(
+          G.session.post('{}/{}'.format(s, url), data=blob, ssl=False))
+          for s in ARGS.servers],
+        return_exceptions=True)
+
+    result = dict()
+    for s, r in zip(ARGS.servers, responses):
+        if type(r) is aiohttp.client_reqrep.ClientResponse:
+            if 200 == r.status:
+                result[s] = await r.read()
+
+    return result
+
+
+async def paxos_client(key, value):
+    paxos_seq = int(time.time())
+
+    res = await rpc('promise/{}/{}'.format(paxos_seq, key))
+    if ARGS.quorum > len(res):
+        return 'NO_PROMISE_QUORUM'
+
+    proposal = (0, value)
+    for srv, body in res.items():
+        accepted_seq, accepted_val = pickle.loads(body)
+        if accepted_seq > proposal[0]:
+            proposal = (accepted_seq, accepted_val)
+
+    res = await rpc('accept/{}/{}'.format(paxos_seq, key), proposal[1])
+    if ARGS.quorum > len(res):
+        return 'NO_ACCEPT_QUORUM'
+
+    res = await rpc('learn/{}/{}'.format(paxos_seq, key))
+    if ARGS.quorum > len(res):
+        return 'NO_LEARN_QUORUM'
+
+    return 'CONFLICT' if value is not proposal[1] else 'OK'
 
 
 # Form a hierarchical path to avoid too many files in a directory
@@ -30,192 +125,45 @@ def seq2path(seq):
     return os.path.join('data', str(three), str(two), str(one), str(seq))
 
 
-# Failsafe file creation. Write a tmp file and then move to final path
-def blob_dump(path, blob):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    tmppath = '{}-{}.tmp'.format(path, uuid.uuid4())
-
-    with open(tmppath, 'wb') as fd:
-        fd.write(blob)
-
-    os.rename(tmppath, path)
-
-
-def json_dump(path, obj):
-    blob_dump(path, json.dumps(obj, indent=4).encode())
-
-
-# Write the blob with a unique filename
-# and then simulate a paxos accept request
-@APP.post('/<seq:int>/<uuid:str>')
-async def dump(request, seq, uuid):
-    seq = int(seq)
-
-    filepath = seq2path(seq)
-    if not allowed(request) or os.path.isfile(filepath):
-        raise sanic.exception.Unauthorized()
-
-    G.max_seq = max(seq, G.max_seq)
-    blobpath = os.path.join(os.path.dirname(filepath), uuid)
-
-    blob_dump(blobpath, request.body)
-    blob_dump(filepath, json.dumps(dict(
-        promised_seq=1, accepted_seq=1,
-        accepted_val=uuid), indent=4).encode())
-
-    return sanic.response.json(dict(status='OK', max_seq=G.max_seq))
-
-
-# If a majority replies, our accept request for this seq is successful
-# On the read side all paxos rounds would be run to finalize the write
 @APP.post('/')
 async def append(request):
-    n = len(ARGS.servers)
-    G.max_seq = int((G.max_seq+n)/n)*n + ARGS.index
-    seq = G.max_seq
+    res = await rpc('next/seq')
+    if ARGS.quorum > len(res):
+        return 'NO_QUORUM'
 
-    guid = str(uuid.uuid4())
-    res = await Client.multi_post('{}/{}'.format(seq, guid), request.body)
+    seq = max([pickle.loads(body) for body in res.values()]) + 1
+    G.max_seq = seq
 
-    if ARGS.quorum > len([r for r in res.values() if r['status'] == 'OK']):
-        raise sanic.exceptions.ServiceUnavailable()
+    status = await paxos_client(seq2path(seq), request.body)
 
-    return sanic.response.json(seq, headers={
-        'x-msgbox-seq': seq,
-        'x-msgbox-length': len(request.body)})
-
-
-@APP.post('/paxos/<phase:str>/<seq:int>')
-async def paxos_server(request, phase, seq):
-    seq = int(seq)
-
-    if not allowed(request):
-        raise sanic.exception.Unauthorized()
-
-    G.max_seq = max(seq, G.max_seq)
-
-    paxos = dict(promised_seq=0, accepted_seq=0, accepted_val=None)
-
-    filepath = seq2path(seq)
-    if os.path.isfile(filepath):
-        with open(filepath) as fd:
-            paxos = json.loads(fd.read())
-
-    if 'learned_val' in paxos:
-        return sanic.response.json(dict(
-            status='OK',
-            accepted_seq=10**15,
-            accepted_val=paxos['learned_val']))
-
-    request = request.json
-
-    if 'promise' == phase and request['proposal_seq'] > paxos['promised_seq']:
-        json_dump(filepath, dict(
-            promised_seq=request['proposal_seq'],
-            accepted_seq=paxos['accepted_seq'],
-            accepted_val=paxos['accepted_val']))
-
-        return sanic.response.json(dict(
-            status='OK',
-            accepted_seq=paxos['accepted_seq'],
-            accepted_val=paxos['accepted_val']))
-
-    if request.get('proposal_val', None):
-        dirpath = os.path.dirname(seq2path(seq))
-        blobpath = os.path.join(dirpath, request['proposal_val'])
-        for srv in ARGS.servers:
-            if not os.path.isfile(blobpath):
-                url = '{}/{}/{}'.format(srv, seq, request['proposal_val'])
-                res = await Client.get_blob(url)
-                if 200 == res['status']:
-                    blob_dump(blobpath, res['blob'])
-
-        if not os.path.isfile(blobpath):
-            return sanic.response.json(dict(status='BLOB_NOT_FOUND'))
-
-    if 'accept' == phase and request['proposal_seq'] >= paxos['promised_seq']:
-        json_dump(filepath, dict(
-            promised_seq=request['proposal_seq'],
-            accepted_seq=request['proposal_seq'],
-            accepted_val=request['proposal_val']))
-
-        return sanic.response.json(dict(status='OK'))
-
-    if 'learn' == phase and request['proposal_seq'] >= paxos['promised_seq']:
-        json_dump(filepath, dict(learned_val=request['proposal_val']))
-
-        return sanic.response.json(dict(status='OK'))
-
-    return sanic.response.json(dict(status='INVALID'))
-
-
-@APP.get('/<seq:int>/<uuid:str>')
-async def blob_read(request, seq, uuid):
-    dirpath = os.path.dirname(seq2path(seq))
-    blobpath = os.path.join(dirpath, uuid)
-
-    if os.path.isfile(blobpath):
-        with open(blobpath, 'rb') as fd:
-            return sanic.response.raw(fd.read())
-
-    return sanic.response.text('NOT_FOUND', status=404)
+    if 'OK' == status:
+        return sanic.response.json(seq, headers={
+            'x-logdb-seq': seq,
+            'x-logdb-length': len(request.body)})
 
 
 @APP.get('/<seq:int>')
-async def paxos_client(request, seq):
+async def tail(request, seq):
     seq = int(seq)
 
     if seq > G.max_seq:
         await asyncio.sleep(1)
         raise sanic.exceptions.NotFound()
 
-    paxos = dict()
-    paxospath = seq2path(seq)
-    if os.path.isfile(paxospath):
-        with open(paxospath) as fd:
-            paxos = json.load(fd)
+    key = seq2path(seq)
 
-    if 'learned_val' not in paxos:
-        paxos_seq = int(time.time())
+    for i in range(2):
+        if os.path.isfile(key):
+            with open(key, 'rb') as fd:
+                promised_seq, accepted_seq = struct.unpack('!II', fd.read(8))
 
-        proposal = json.dumps(dict(proposal_seq=paxos_seq)).encode()
-        res = await Client.multi_post('paxos/promise/{}'.format(seq), proposal)
-        res = [v for v in res.values() if 'OK' == v['status']]
-        if ARGS.quorum > len(res):
-            return sanic.response.text('NO_PROMISE_QUORUM', status=503)
+                if 0 == promised_seq and 0 == accepted_seq:
+                    blob = fd.read()
+                    return sanic.response.raw(blob, headers={
+                        'x-logdb-seq': seq,
+                        'x-logdb-length': len(blob)})
 
-        proposal = (0, None)
-        for v in res:
-            if v['accepted_seq'] > proposal[0]:
-                proposal = (v['accepted_seq'], v['accepted_val'])
-
-        proposed_val = proposal[1]
-        proposal = dict(proposal_seq=paxos_seq, proposal_val=proposal[1])
-        proposal = json.dumps(proposal).encode()
-
-        res = await Client.multi_post('paxos/accept/{}'.format(seq), proposal)
-        if ARGS.quorum > len([v for v in res.values() if 'OK' == v['status']]):
-            return sanic.response.text('NO_ACCEPT_QUORUM', status=503)
-
-        res = await Client.multi_post('paxos/learn/{}'.format(seq), proposal)
-        if ARGS.quorum > len([v for v in res.values() if 'OK' == v['status']]):
-            return sanic.response.text('NO_LEARN_QUORUM', status=503)
-
-        paxos['learned_val'] = proposed_val
-
-    if 'learned_val' in paxos:
-        blob = b''
-        if paxos['learned_val']:
-            dirpath = os.path.dirname(seq2path(seq))
-            blobpath = os.path.join(dirpath, paxos['learned_val'])
-
-            with open(blobpath, 'rb') as fd:
-                blob = fd.read()
-
-        return sanic.response.raw(blob, headers={
-            'x-msgbox-seq': seq,
-            'x-msgbox-length': len(blob)})
+        await paxos_client(key, b'')
 
 
 def allowed(request):
@@ -229,46 +177,9 @@ def allowed(request):
     return False
 
 
-class Client:
-    @classmethod
-    async def get_blob(self, url):
-        async with aiohttp.ClientSession(headers=self.headers) as s:
-            try:
-                async with s.get(url, ssl=False) as r:
-                    return dict(status=r.status, headers=r.headers,
-                                blob=await r.read())
-            except Exception:
-                return dict(status=500)
-
-    @classmethod
-    async def post(self, url, data):
-        async with aiohttp.ClientSession(headers=self.headers) as s:
-            try:
-                async with s.post(url, data=data, ssl=False) as r:
-                    return dict(status=r.status, headers=r.headers,
-                                json=await r.json())
-            except Exception:
-                return dict(status=500)
-
-    @classmethod
-    async def multi_post(self, url, data):
-        responses = await asyncio.gather(*[
-            asyncio.ensure_future(
-                self.post('{}/{}'.format(s, url), data))
-            for s in ARGS.servers],
-            return_exceptions=True)
-
-        result = dict()
-        for s, r in zip(ARGS.servers, responses):
-            if type(r) is dict and 200 == r['status']:
-                result[s] = r['json']
-        return result
-
-
 if '__main__' == __name__:
     ARGS = argparse.ArgumentParser()
     ARGS.add_argument('--port', dest='port', type=int)
-    ARGS.add_argument('--index', dest='index', type=int)
     ARGS.add_argument('--batch', dest='batch', type=int, default=100)
     ARGS.add_argument('--quorum', dest='quorum', type=int, default=0)
     ARGS.add_argument('--conf', dest='conf', default='config.json')
@@ -280,7 +191,7 @@ if '__main__' == __name__:
     ARGS.auth_key = config['auth_key']
     ARGS.servers = config['servers']
     ARGS.quorum = max(ARGS.quorum, int(len(ARGS.servers)/2) + 1)
-    Client.headers = {'x-auth-key': ARGS.auth_key}
+    G.auth_header = {'x-auth-key': ARGS.auth_key}
 
     # Find the maximum seq written so far
     path = 'data'

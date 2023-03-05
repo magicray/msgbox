@@ -1,4 +1,3 @@
-import time
 import random
 import requests
 
@@ -12,14 +11,11 @@ class Client:
             srv = random.choice(self.servers)
             res = dict(server=srv, seq=seq)
             try:
-                t = time.time()
                 r = requests.get('{}/{}'.format(srv, seq))
                 if 200 != r.status_code:
                     raise Exception('http_response : {}'.format(r.status_code))
 
-                msec = int((time.time() - t)*1000)
-
-                res.update(dict(srv=srv, seq=seq, msec=msec, blob=r.content))
+                res.update(dict(srv=srv, seq=seq, blob=r.content))
                 yield res
 
                 seq += 1
@@ -32,13 +28,10 @@ class Client:
             srv = random.choice(self.servers)
 
             try:
-                t = time.time()
                 r = requests.post(srv, data=blob)
-                msec = int((time.time() - t)*1000)
-
                 if 200 == r.status_code:
-                    return dict(srv=srv, msec=msec,
-                                seq=r.headers['x-msgbox-seq'],
-                                length=r.headers['x-msgbox-length'])
+                    return dict(srv=srv,
+                                seq=r.headers['x-logdb-seq'],
+                                length=r.headers['x-logdb-length'])
             except Exception:
                 pass
