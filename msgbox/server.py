@@ -4,7 +4,6 @@ import json
 import uuid
 import sanic
 import signal
-import struct
 import pickle
 import random
 import asyncio
@@ -21,6 +20,10 @@ class G:
     max_seq = None
     session = None
 
+    # DateTime  - 'YYYYMMDD-HHMMSS'
+    default_seq = '00000000-000000'
+    learned_seq = '99999999-999999'
+
 
 def allowed(request):
     if ARGS.auth_key == request.headers.get('x-auth-key', None):
@@ -36,43 +39,61 @@ async def next_seq(request):
     return sanic.response.raw(pickle.dumps(G.max_seq))
 
 
-@APP.post('/<phase:str>/<proposal_seq:int>/<key:path>')
-async def paxos_server(request, phase, proposal_seq, key):
-    proposal_seq = int(proposal_seq)
+def paxos_encode(promised_seq, accepted_seq):
+    result = '{}\n{}\n'.format(promised_seq, accepted_seq).encode()
+    assert(32 == len(result))
+    return result
 
+
+def paxos_decode(input_bytes):
+    assert(32 == len(input_bytes))
+    promised_seq, accepted_seq, _ = input_bytes.decode().split('\n')
+    return promised_seq, accepted_seq
+
+
+@APP.post('/<phase:str>/<proposal_seq:str>/<key:path>')
+async def paxos_server(request, phase, proposal_seq, key):
     if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
-    os.makedirs(os.path.dirname(key), exist_ok=True)
+    assert(15 == len(proposal_seq))
 
-    promised_seq, accepted_seq = 0, 0
+    os.makedirs(os.path.dirname(key), exist_ok=True)
+    tmpfile = '{}-{}.tmp'.format(key, uuid.uuid4())
+
+    promised_seq = accepted_seq = G.default_seq
     if os.path.isfile(key):
         with open(key, 'rb') as fd:
-            promised_seq, accepted_seq = struct.unpack('!II', fd.read(8))
+            promised_seq, accepted_seq = paxos_decode(fd.read(32))
 
-            if 0 == promised_seq and 0 == accepted_seq:
-                return sanic.response.raw(pickle.dumps([10**15, fd.read()]))
+            if G.learned_seq == promised_seq == accepted_seq:
+                return sanic.response.raw(pickle.dumps(
+                    [G.learned_seq, fd.read()]))
 
     if 'promise' == phase and proposal_seq > promised_seq:
-        mode = 'r+b' if os.path.isfile(key) else 'w+b'
+        if os.path.isfile(key):
+            with open(key, 'r+b') as fd:
+                fd.write(paxos_encode(proposal_seq, accepted_seq))
+        else:
+            with open(tmpfile, 'wb') as fd:
+                fd.write(paxos_encode(proposal_seq, accepted_seq))
+            os.rename(tmpfile, key)
 
-        with open(key, mode) as fd:
-            fd.write(struct.pack('!II', proposal_seq, accepted_seq))
-
+        with open(key, 'rb') as fd:
+            promised_seq, accepted_seq = paxos_decode(fd.read(32))
             return sanic.response.raw(pickle.dumps([accepted_seq, fd.read()]))
 
     if 'accept' == phase and proposal_seq == promised_seq:
-        tmpfile = '{}-{}.tmp'.format(key, uuid.uuid4())
         with open(tmpfile, 'wb') as fd:
-            fd.write(struct.pack('!II', proposal_seq, proposal_seq))
+            fd.write(paxos_encode(proposal_seq, proposal_seq))
             fd.write(request.body)
         os.rename(tmpfile, key)
 
         return sanic.response.raw(b'OK')
 
-    if 'learn' == phase and proposal_seq == promised_seq:
+    if 'learn' == phase and proposal_seq == promised_seq == accepted_seq:
         with open(key, 'r+b') as fd:
-            fd.write(struct.pack('!II', 0, 0))
+            fd.write(paxos_encode(G.learned_seq, G.learned_seq))
 
         return sanic.response.raw(b'OK')
 
@@ -97,13 +118,13 @@ async def rpc(url, blob=None):
 
 
 async def paxos_client(key, value):
-    paxos_seq = int(time.time())
+    paxos_seq = time.strftime('%Y%m%d-%H%M%S')
 
     res = await rpc('promise/{}/{}'.format(paxos_seq, key))
     if ARGS.quorum > len(res):
         return 'NO_PROMISE_QUORUM'
 
-    proposal = (0, value)
+    proposal = (G.default_seq, value)
     for srv, body in res.items():
         accepted_seq, accepted_val = pickle.loads(body)
         if accepted_seq > proposal[0]:
@@ -158,9 +179,9 @@ async def tail(request, seq):
     for i in range(2):
         if os.path.isfile(key):
             with open(key, 'rb') as fd:
-                promised_seq, accepted_seq = struct.unpack('!II', fd.read(8))
+                promised_seq, accepted_seq = paxos_decode(fd.read(32))
 
-                if 0 == promised_seq and 0 == accepted_seq:
+                if G.learned_seq == promised_seq == accepted_seq:
                     blob = fd.read()
                     return sanic.response.raw(blob, headers={
                         'x-logdb-seq': seq,
