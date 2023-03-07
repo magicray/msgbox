@@ -30,7 +30,7 @@ def allowed(request):
         return True
 
 
-@APP.post('/next/seq')
+@APP.post('/seq/next')
 async def next_seq(request):
     if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
@@ -51,12 +51,14 @@ def paxos_decode(input_bytes):
     return promised_seq, accepted_seq
 
 
+def response(obj):
+    return sanic.response.raw(pickle.dumps(obj))
+
+
 @APP.post('/<phase:str>/<proposal_seq:str>/<key:path>')
 async def paxos_server(request, phase, proposal_seq, key):
     if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
-
-    assert(15 == len(proposal_seq))
 
     os.makedirs(os.path.dirname(key), exist_ok=True)
     tmpfile = '{}-{}.tmp'.format(key, uuid.uuid4())
@@ -66,10 +68,22 @@ async def paxos_server(request, phase, proposal_seq, key):
         with open(key, 'rb') as fd:
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
 
+            # Value for this key has already been learned
+            # Just play along and respond to any new paxos rounds
+            # to help the nodes that do not have this value yet.
+            #
+            # Respond to promise/accept/learn requests normally,
+            # without updating anything. Return the largest possible
+            # accepted_seq number, so that this value is proposed by
+            # the node that initiated this round.
             if G.learned_seq == promised_seq == accepted_seq:
-                return sanic.response.raw(pickle.dumps(
-                    [G.learned_seq, fd.read()]))
+                if 'promise' == phase:
+                    return response([accepted_seq, fd.read()])
 
+                return response('OK')
+
+    # Update the header if file already exists.
+    # Atomically create a new file if it does not already exist.
     if 'promise' == phase and proposal_seq > promised_seq:
         if os.path.isfile(key):
             with open(key, 'r+b') as fd:
@@ -81,30 +95,39 @@ async def paxos_server(request, phase, proposal_seq, key):
 
         with open(key, 'rb') as fd:
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
-            return sanic.response.raw(pickle.dumps([accepted_seq, fd.read()]))
+            return response([accepted_seq, fd.read()])
 
+    # Atomically write the header and accepted value by creating
+    # a tmp file and then renaming it.
     if 'accept' == phase and proposal_seq == promised_seq:
         with open(tmpfile, 'wb') as fd:
             fd.write(paxos_encode(proposal_seq, proposal_seq))
-            fd.write(request.body)
+            fd.write(pickle.loads(request.body))
         os.rename(tmpfile, key)
 
-        return sanic.response.raw(b'OK')
+        return response('OK')
 
+    # This value is now final
+    # Mark promise_seq = accepted_seq = '99999999-999999'
+    # This is largest value for seq and would ensure that any
+    # paxos rounds for this key are forced to accept this value only.
     if 'learn' == phase and proposal_seq == promised_seq == accepted_seq:
         with open(key, 'r+b') as fd:
             fd.write(paxos_encode(G.learned_seq, G.learned_seq))
 
-        return sanic.response.raw(b'OK')
+        return response('OK')
 
 
-async def rpc(url, blob=None):
+async def rpc(url, obj=None):
     if G.session is None:
-        G.session = aiohttp.ClientSession(headers=G.auth_header)
+        G.session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=1000),
+            headers=G.auth_header)
 
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
-          G.session.post('{}/{}'.format(s, url), data=blob, ssl=False))
+          G.session.post('{}/{}'.format(s, url),
+                         data=pickle.dumps(obj), ssl=False))
           for s in ARGS.servers],
         return_exceptions=True)
 
@@ -112,30 +135,27 @@ async def rpc(url, blob=None):
     for s, r in zip(ARGS.servers, responses):
         if type(r) is aiohttp.client_reqrep.ClientResponse:
             if 200 == r.status:
-                result[s] = await r.read()
+                result[s] = pickle.loads(await r.read())
 
     return result
 
 
 async def paxos_client(key, value):
-    paxos_seq = time.strftime('%Y%m%d-%H%M%S')
+    seq_key = '{}/{}'.format(time.strftime('%Y%m%d-%H%M%S'), key)
 
-    res = await rpc('promise/{}/{}'.format(paxos_seq, key))
+    res = await rpc('promise/{}'.format(seq_key))
     if ARGS.quorum > len(res):
         return 'NO_PROMISE_QUORUM'
 
     proposal = (G.default_seq, value)
-    for srv, body in res.items():
-        accepted_seq, accepted_val = pickle.loads(body)
+    for srv, (accepted_seq, accepted_val) in res.items():
         if accepted_seq > proposal[0]:
             proposal = (accepted_seq, accepted_val)
 
-    res = await rpc('accept/{}/{}'.format(paxos_seq, key), proposal[1])
-    if ARGS.quorum > len(res):
+    if ARGS.quorum > len(await rpc('accept/{}'.format(seq_key), proposal[1])):
         return 'NO_ACCEPT_QUORUM'
 
-    res = await rpc('learn/{}/{}'.format(paxos_seq, key))
-    if ARGS.quorum > len(res):
+    if ARGS.quorum > len(await rpc('learn/{}'.format(seq_key))):
         return 'NO_LEARN_QUORUM'
 
     return 'CONFLICT' if value is not proposal[1] else 'OK'
@@ -154,11 +174,11 @@ def seq2path(seq):
 
 @APP.post('/')
 async def append(request):
-    res = await rpc('next/seq')
+    res = await rpc('seq/next')
     if ARGS.quorum > len(res):
         return 'NO_QUORUM'
 
-    seq = max([pickle.loads(body) for body in res.values()])
+    seq = max([obj for obj in res.values()])
 
     if 'OK' == await paxos_client(seq2path(seq), request.body):
         return sanic.response.json(seq, headers={
