@@ -6,9 +6,8 @@ import hashlib
 
 
 def append(client, blob):
-    result = client.append(blob)
-
-    sys.stderr.write(json.dumps(result, indent=4, sort_keys=True) + '\n')
+    result = json.dumps(client.append(blob), indent=4, sort_keys=True)
+    sys.stderr.write(result + '\n')
 
 
 def tail(client, seq):
@@ -20,15 +19,16 @@ def tail(client, seq):
                 x = hashlib.md5(blob).hexdigest()
                 y = chksum + x
                 y = hashlib.md5(y.encode()).hexdigest()
-                print('{} {} {} {}'.format(y, x, r['seq'], len(blob)))
+                res = 'log({}) blob({}) seq({}) len({})'.format(
+                    y, x, r['seq'], len(blob))
+                sys.stderr.write(res + '\n')
         else:
             time.sleep(1)
 
 
 def put(client, key, value):
-    result = client.put(key, value)
-
-    sys.stderr.write(json.dumps(result, indent=4, sort_keys=True) + '\n')
+    result = json.dumps(client.put(key, value), indent=4, sort_keys=True)
+    sys.stderr.write(result + '\n')
 
 
 if '__main__' == __name__:

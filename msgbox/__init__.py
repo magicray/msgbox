@@ -7,20 +7,22 @@ requests.packages.urllib3.disable_warnings()
 class Client:
     def __init__(self, servers):
         self.servers = servers
+        self.session = requests.Session()
+        self.session.verify = False
 
-    def tail(self, seq):
+    def tail(self, seq, step=1):
         while True:
             srv = 'https://{}'.format(random.choice(self.servers))
             res = dict(server=srv, seq=seq)
             try:
-                r = requests.get('{}/{}'.format(srv, seq), verify=False)
+                r = self.session.get('{}/{}'.format(srv, seq))
                 if 200 != r.status_code:
                     raise Exception('http_response : {}'.format(r.status_code))
 
-                res.update(dict(srv=srv, seq=seq, blob=r.content))
+                res.update(dict(blob=r.content))
                 yield res
 
-                seq += 1
+                seq += step
             except Exception as e:
                 res.update(dict(exception=str(e)))
                 yield res
@@ -30,7 +32,7 @@ class Client:
             srv = 'https://{}'.format(random.choice(self.servers))
 
             try:
-                r = requests.post(srv, data=blob, verify=False)
+                r = self.session.post(srv, data=blob)
                 if 200 == r.status_code:
                     return dict(srv=srv,
                                 seq=r.headers['x-logdb-seq'],
@@ -43,8 +45,7 @@ class Client:
             srv = 'https://{}'.format(random.choice(self.servers))
 
             try:
-                r = requests.put('{}/{}'.format(srv, key), data=value,
-                                 verify=False)
+                r = self.session.put('{}/{}'.format(srv, key), data=value)
                 if 200 == r.status_code:
                     return dict(srv=srv, status=r.json(),
                                 length=r.headers['x-logdb-length'])

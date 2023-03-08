@@ -1,6 +1,6 @@
 import os
+import sys
 import time
-import json
 import uuid
 import sanic
 import signal
@@ -8,7 +8,6 @@ import pickle
 import random
 import asyncio
 import aiohttp
-import argparse
 
 
 APP = sanic.Sanic('logdb')
@@ -26,7 +25,7 @@ class G:
 
 
 def allowed(request):
-    if ARGS.auth_key == request.headers.get('x-auth-key', None):
+    if G.cluster_key == request.headers.get('x-auth-key', None):
         return True
 
 
@@ -128,11 +127,11 @@ async def rpc(url, obj=None):
         *[asyncio.ensure_future(
           G.session.post('https://{}/{}'.format(s, url),
                          data=pickle.dumps(obj), ssl=False))
-          for s in ARGS.servers],
+          for s in G.servers],
         return_exceptions=True)
 
     result = dict()
-    for s, r in zip(ARGS.servers, responses):
+    for s, r in zip(G.servers, responses):
         if type(r) is aiohttp.client_reqrep.ClientResponse:
             if 200 == r.status:
                 result[s] = pickle.loads(await r.read())
@@ -144,7 +143,7 @@ async def paxos_client(key, value):
     seq_key = '{}/{}'.format(time.strftime('%Y%m%d-%H%M%S'), key)
 
     res = await rpc('promise/{}'.format(seq_key))
-    if ARGS.quorum > len(res):
+    if G.quorum > len(res):
         return 'NO_PROMISE_QUORUM'
 
     proposal = (G.default_seq, value)
@@ -152,10 +151,10 @@ async def paxos_client(key, value):
         if accepted_seq > proposal[0]:
             proposal = (accepted_seq, accepted_val)
 
-    if ARGS.quorum > len(await rpc('accept/{}'.format(seq_key), proposal[1])):
+    if G.quorum > len(await rpc('accept/{}'.format(seq_key), proposal[1])):
         return 'NO_ACCEPT_QUORUM'
 
-    if ARGS.quorum > len(await rpc('learn/{}'.format(seq_key))):
+    if G.quorum > len(await rpc('learn/{}'.format(seq_key))):
         return 'NO_LEARN_QUORUM'
 
     return 'CONFLICT' if value is not proposal[1] else 'OK'
@@ -163,7 +162,7 @@ async def paxos_client(key, value):
 
 # Form a hierarchical path to avoid too many files in a directory
 def seq2path(seq):
-    batch_size = ARGS.batch
+    batch_size = 100
 
     one = str(int(seq / batch_size) % batch_size)
     two = str(int(seq / batch_size**2) % batch_size)
@@ -176,7 +175,7 @@ def seq2path(seq):
 async def append(request):
     res = await rpc('seq/next')
 
-    if len(res) >= ARGS.quorum:
+    if len(res) >= G.quorum:
         seq = max([obj for obj in res.values()])
 
         if 'OK' == await paxos_client(seq2path(seq), request.body):
@@ -229,20 +228,19 @@ async def get(request, key):
 
 
 if '__main__' == __name__:
-    ARGS = argparse.ArgumentParser()
-    ARGS.add_argument('--port', dest='port', type=int)
-    ARGS.add_argument('--batch', dest='batch', type=int, default=100)
-    ARGS.add_argument('--quorum', dest='quorum', type=int, default=0)
-    ARGS.add_argument('--conf', dest='conf', default='config.json')
-    ARGS = ARGS.parse_args()
+    G.servers = list()
+    for i in range(1, len(sys.argv)):
+        G.servers.append(sys.argv[i])
 
-    with open(ARGS.conf) as fd:
-        config = json.load(fd)
+    G.host = G.servers[0].split(':')[0]
+    G.port = int(G.servers[0].split(':')[1])
+    G.servers = set(G.servers)
 
-    ARGS.servers = config['servers']
-    ARGS.auth_key = config['auth_key']
-    ARGS.quorum = max(ARGS.quorum, int(len(ARGS.servers)/2) + 1)
-    G.auth_header = {'x-auth-key': ARGS.auth_key}
+    with open('cluster.key') as fd:
+        G.cluster_key = fd.read().strip()
+        G.auth_header = {'x-auth-key': G.cluster_key}
+
+    G.quorum = int(len(G.servers)/2) + 1
 
     os.makedirs(os.path.join('data', 'kv'), exist_ok=True)
     os.makedirs(os.path.join('data', 'log'), exist_ok=True)
@@ -257,5 +255,5 @@ if '__main__' == __name__:
     filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
     G.max_seq = max(filenames) if filenames else 0
 
-    APP.run(port=ARGS.port, single_process=True, access_log=True,
+    APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
