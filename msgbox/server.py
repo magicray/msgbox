@@ -6,8 +6,10 @@ import sanic
 import signal
 import pickle
 import random
+import hashlib
 import asyncio
 import aiohttp
+import logging
 
 
 APP = sanic.Sanic('logdb')
@@ -121,7 +123,7 @@ async def rpc(url, obj=None):
     if G.session is None:
         G.session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=1000),
-            headers=G.auth_header)
+            headers={'x-auth-key': G.cluster_key})
 
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
@@ -228,17 +230,16 @@ async def get(request, key):
 
 
 if '__main__' == __name__:
-    G.servers = list()
+    G.servers = set()
     for i in range(1, len(sys.argv)):
-        G.servers.append(sys.argv[i])
+        G.servers.add(sys.argv[i])
 
-    G.host = G.servers[0].split(':')[0]
-    G.port = int(G.servers[0].split(':')[1])
-    G.servers = set(G.servers)
+    G.host, G.port = sys.argv[1].split(':')
+    G.port = int(G.port)
 
     with open('cluster.key') as fd:
-        G.cluster_key = fd.read().strip()
-        G.auth_header = {'x-auth-key': G.cluster_key}
+        G.cluster_key = fd.read().strip() + ''.join(sorted(G.servers))
+        G.cluster_key = hashlib.md5(G.cluster_key.encode()).hexdigest()
 
     G.quorum = int(len(G.servers)/2) + 1
 
@@ -254,6 +255,10 @@ if '__main__' == __name__:
 
     filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
     G.max_seq = max(filenames) if filenames else 0
+
+    logging.critical('Starting server : {}:{}'.format(G.host, G.port))
+    for i, srv in enumerate(sorted(G.servers)):
+        logging.critical('cluster node({}) : {}'.format(i+1, srv))
 
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))

@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 import json
@@ -10,9 +11,9 @@ def append(client, blob):
     sys.stderr.write(result + '\n')
 
 
-def tail(client, seq):
+def tail(client, seq, step):
     chksum = ''
-    for r in client.tail(seq):
+    for r in client.tail(seq, step):
         if 'blob' in r:
             blob = r.pop('blob', b'')
             if blob:
@@ -26,6 +27,10 @@ def tail(client, seq):
             time.sleep(1)
 
 
+def get(client, key):
+    pass
+
+
 def put(client, key, value):
     result = json.dumps(client.put(key, value), indent=4, sort_keys=True)
     sys.stderr.write(result + '\n')
@@ -37,8 +42,11 @@ if '__main__' == __name__:
     if 2 == len(sys.argv):
         append(client, sys.stdin.read())
 
-    if 3 == len(sys.argv) and sys.argv[2].isdigit():
-        tail(client, int(sys.argv[2]))
+    if 3 == len(sys.argv):
+        if os.path.basename(sys.argv[2]).isdigit():
+            put(client, sys.argv[2], sys.stdin.read())
+        else:
+            get(client, sys.argv[2])
 
-    if 3 == len(sys.argv) and not sys.argv[2].isdigit():
-        put(client, sys.argv[2], sys.stdin.read())
+    if 4 == len(sys.argv):
+        tail(client, int(sys.argv[2]), int(sys.argv[3]))
