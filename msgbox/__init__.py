@@ -1,6 +1,8 @@
 import random
 import requests
 
+requests.packages.urllib3.disable_warnings()
+
 
 class Client:
     def __init__(self, servers):
@@ -8,10 +10,10 @@ class Client:
 
     def tail(self, seq):
         while True:
-            srv = random.choice(self.servers)
+            srv = 'https://{}'.format(random.choice(self.servers))
             res = dict(server=srv, seq=seq)
             try:
-                r = requests.get('{}/{}'.format(srv, seq))
+                r = requests.get('{}/{}'.format(srv, seq), verify=False)
                 if 200 != r.status_code:
                     raise Exception('http_response : {}'.format(r.status_code))
 
@@ -25,10 +27,10 @@ class Client:
 
     def append(self, blob):
         for i in range(len(self.servers)):
-            srv = random.choice(self.servers)
+            srv = 'https://{}'.format(random.choice(self.servers))
 
             try:
-                r = requests.post(srv, data=blob)
+                r = requests.post(srv, data=blob, verify=False)
                 if 200 == r.status_code:
                     return dict(srv=srv,
                                 seq=r.headers['x-logdb-seq'],
@@ -38,10 +40,11 @@ class Client:
 
     def put(self, key, value):
         for i in range(len(self.servers)):
-            srv = random.choice(self.servers)
+            srv = 'https://{}'.format(random.choice(self.servers))
 
             try:
-                r = requests.put('{}/{}'.format(srv, key), data=value)
+                r = requests.put('{}/{}'.format(srv, key), data=value,
+                                 verify=False)
                 if 200 == r.status_code:
                     return dict(srv=srv, status=r.json(),
                                 length=r.headers['x-logdb-length'])

@@ -126,7 +126,7 @@ async def rpc(url, obj=None):
 
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
-          G.session.post('{}/{}'.format(s, url),
+          G.session.post('https://{}/{}'.format(s, url),
                          data=pickle.dumps(obj), ssl=False))
           for s in ARGS.servers],
         return_exceptions=True)
@@ -175,15 +175,14 @@ def seq2path(seq):
 @APP.post('/')
 async def append(request):
     res = await rpc('seq/next')
-    if ARGS.quorum > len(res):
-        return 'NO_QUORUM'
 
-    seq = max([obj for obj in res.values()])
+    if len(res) >= ARGS.quorum:
+        seq = max([obj for obj in res.values()])
 
-    if 'OK' == await paxos_client(seq2path(seq), request.body):
-        return sanic.response.json(seq, headers={
-            'x-logdb-seq': seq,
-            'x-logdb-length': len(request.body)})
+        if 'OK' == await paxos_client(seq2path(seq), request.body):
+            return sanic.response.json(seq, headers={
+                'x-logdb-seq': seq,
+                'x-logdb-length': len(request.body)})
 
 
 @APP.get('/<seq:int>')
@@ -240,8 +239,8 @@ if '__main__' == __name__:
     with open(ARGS.conf) as fd:
         config = json.load(fd)
 
-    ARGS.auth_key = config['auth_key']
     ARGS.servers = config['servers']
+    ARGS.auth_key = config['auth_key']
     ARGS.quorum = max(ARGS.quorum, int(len(ARGS.servers)/2) + 1)
     G.auth_header = {'x-auth-key': ARGS.auth_key}
 
@@ -252,13 +251,11 @@ if '__main__' == __name__:
     path = os.path.join('data', 'log')
     for i in range(3):
         filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
-        if filenames:
-            path = os.path.join(path, str(max(filenames)))
-        else:
-            path = os.path.join(path, '0')
-            os.makedirs(path)
+        path = os.path.join(path, str(max(filenames)) if filenames else '0')
+        os.makedirs(path, exist_ok=True)
 
     filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
     G.max_seq = max(filenames) if filenames else 0
 
-    APP.run(port=ARGS.port, single_process=True, access_log=True)
+    APP.run(port=ARGS.port, single_process=True, access_log=True,
+            ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
