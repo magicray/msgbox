@@ -23,21 +23,11 @@ class G:
 
     # DateTime  - 'YYYYMMDD-HHMMSS'
     default_seq = '00000000-000000'
-    learned_seq = '99999999-999999'
 
 
 def allowed(request):
     if G.cluster_key == request.headers.get('x-auth-key', None):
         return True
-
-
-@APP.post('/seq/next')
-async def next_seq(request):
-    if allowed(request) is not True:
-        raise sanic.exceptions.Unauthorized('Unauthorized Request')
-
-    G.max_seq += 1
-    return sanic.response.raw(pickle.dumps(G.max_seq))
 
 
 def paxos_encode(promised_seq, accepted_seq):
@@ -56,9 +46,21 @@ def response(obj):
     return sanic.response.raw(pickle.dumps(obj))
 
 
+@APP.post('/seq/next')
+async def next_seq(request):
+    if allowed(request) is not True:
+        raise sanic.exceptions.Unauthorized('Unauthorized Request')
+
+    G.max_seq += 1
+    return response(G.max_seq)
+
+
 @APP.post('/<phase:str>/<proposal_seq:str>/<key:path>')
 async def paxos_server(request, phase, proposal_seq, key):
-    if allowed(request) is not True:
+    # DateTime  - 'YYYYMMDD-HHMMSS'
+    learned_seq = '99999999-999999'
+
+    if request is not None and allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
     os.makedirs(os.path.dirname(key), exist_ok=True)
@@ -69,26 +71,30 @@ async def paxos_server(request, phase, proposal_seq, key):
         with open(key, 'rb') as fd:
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
 
-            # Value for this key has already been learned
-            # Just play along and respond to any new paxos rounds
-            # to help the nodes that do not have this value yet.
-            #
-            # Respond to promise/accept/learn requests normally,
-            # without updating anything. Return the largest possible
-            # accepted_seq number, so that this value is proposed by
-            # the node that initiated this round.
-            if G.learned_seq == promised_seq == accepted_seq:
+            if request is None:
+                return fd.read() if learned_seq == promised_seq else None
+
+            if learned_seq == promised_seq == accepted_seq:
+                # Value for this key has already been learned
+                # Just play along and respond to any new paxos rounds
+                # to help the nodes that do not have this value yet.
+                #
+                # Respond to promise/accept/learn requests normally,
+                # without updating anything. Return the largest possible
+                # accepted_seq number, so that this value is proposed by
+                # the node that initiated this round.
                 if 'promise' == phase:
                     return response([accepted_seq, fd.read()])
 
                 return response('OK')
 
-    # Update the header if file already exists.
-    # Atomically create a new file if it does not already exist.
     if 'promise' == phase and proposal_seq > promised_seq:
+        # Update the header if file already exists.
         if os.path.isfile(key):
             with open(key, 'r+b') as fd:
                 fd.write(paxos_encode(proposal_seq, accepted_seq))
+
+        # Atomically create a new file if it doesn't
         else:
             with open(tmpfile, 'wb') as fd:
                 fd.write(paxos_encode(proposal_seq, accepted_seq))
@@ -98,9 +104,9 @@ async def paxos_server(request, phase, proposal_seq, key):
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
             return response([accepted_seq, fd.read()])
 
-    # Atomically write the header and accepted value by creating
-    # a tmp file and then renaming it.
     if 'accept' == phase and proposal_seq == promised_seq:
+        # Atomically write the header and accepted value by creating
+        # a tmp file and then renaming it.
         with open(tmpfile, 'wb') as fd:
             fd.write(paxos_encode(proposal_seq, proposal_seq))
             fd.write(pickle.loads(request.body))
@@ -108,13 +114,13 @@ async def paxos_server(request, phase, proposal_seq, key):
 
         return response('OK')
 
-    # This value is now final
-    # Mark promise_seq = accepted_seq = '99999999-999999'
-    # This is largest value for seq and would ensure that any
-    # paxos rounds for this key are forced to accept this value only.
     if 'learn' == phase and proposal_seq == promised_seq == accepted_seq:
+        # Mark this value as final.
+        # promise_seq = accepted_seq = '99999999-999999'
+        # This is the largest possible value for seq and would ensure
+        # tha any subsequent paxos rounds for this key accept only this value.
         with open(key, 'r+b') as fd:
-            fd.write(paxos_encode(G.learned_seq, G.learned_seq))
+            fd.write(paxos_encode(learned_seq, learned_seq))
 
         return response('OK')
 
@@ -176,57 +182,32 @@ def seq2path(seq):
 @APP.post('/')
 async def append(request):
     res = await rpc('seq/next')
+    seq = max([obj for obj in res.values()])
 
-    if len(res) >= G.quorum:
-        seq = max([obj for obj in res.values()])
-
-        if 'OK' == await paxos_client(seq2path(seq), request.body):
-            return sanic.response.json(seq, headers={
-                'x-logdb-seq': seq,
-                'x-logdb-length': len(request.body)})
+    if 'OK' == await paxos_client(seq2path(seq), request.body):
+        return sanic.response.json(seq, headers={
+            'x-server-seq': seq,
+            'x-server-length': len(request.body)})
 
 
 @APP.get('/<seq:int>')
 async def tail(request, seq):
     seq = int(seq)
+    key = seq2path(seq)
 
     if seq > G.max_seq:
         await asyncio.sleep(1)
         raise sanic.exceptions.NotFound()
 
-    key = seq2path(seq)
-
     for i in range(2):
-        if os.path.isfile(key):
-            with open(key, 'rb') as fd:
-                promised_seq, accepted_seq = paxos_decode(fd.read(32))
+        blob = await paxos_server(None, None, seq, key)
 
-                if G.learned_seq == promised_seq == accepted_seq:
-                    blob = fd.read()
-                    return sanic.response.raw(blob, headers={
-                        'x-logdb-seq': seq,
-                        'x-logdb-length': len(blob)})
+        if blob is not None:
+            return sanic.response.raw(blob, headers={
+                'x-server-seq': seq,
+                'x-server-length': len(blob)})
 
         await paxos_client(key, b'')
-
-
-@APP.put('/<key:path>/<version:int>')
-async def put(request, key, version):
-    version = int(version)
-
-    key = os.path.join('data', 'kv', key, str(version))
-    status = await paxos_client(key, request.body)
-
-    return sanic.response.json(status, headers={
-        'x-logdb-length': len(request.body)})
-
-
-@APP.get('/<key:path>')
-async def get(request, key):
-    key = os.path.join('data', 'kv', key)
-
-    return sanic.response.json(key, headers={
-        'x-logdb-length': len(request.body)})
 
 
 if '__main__' == __name__:
@@ -243,7 +224,6 @@ if '__main__' == __name__:
 
     G.quorum = int(len(G.servers)/2) + 1
 
-    os.makedirs(os.path.join('data', 'kv'), exist_ok=True)
     os.makedirs(os.path.join('data', 'log'), exist_ok=True)
 
     # Find the maximum log seq written so far

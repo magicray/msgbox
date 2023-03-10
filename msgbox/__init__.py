@@ -35,19 +35,7 @@ class Client:
                 r = self.session.post(srv, data=blob)
                 if 200 == r.status_code:
                     return dict(srv=srv,
-                                seq=r.headers['x-logdb-seq'],
-                                length=r.headers['x-logdb-length'])
-            except Exception:
-                pass
-
-    def put(self, key, value):
-        for i in range(len(self.servers)):
-            srv = 'https://{}'.format(random.choice(self.servers))
-
-            try:
-                r = self.session.put('{}/{}'.format(srv, key), data=value)
-                if 200 == r.status_code:
-                    return dict(srv=srv, status=r.json(),
-                                length=r.headers['x-logdb-length'])
+                                seq=r.headers['x-server-seq'],
+                                length=r.headers['x-server-length'])
             except Exception:
                 pass
