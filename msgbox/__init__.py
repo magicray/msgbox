@@ -34,8 +34,6 @@ class Client:
             try:
                 r = self.session.post(srv, data=blob)
                 if 200 == r.status_code:
-                    return dict(srv=srv,
-                                seq=r.headers['x-server-seq'],
-                                length=r.headers['x-server-length'])
+                    return dict(srv=srv, seq=r.headers['x-seq'])
             except Exception:
                 pass

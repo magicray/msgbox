@@ -1,5 +1,6 @@
 import os
 import sys
+import hmac
 import time
 import uuid
 import sanic
@@ -22,11 +23,6 @@ class G:
     lock = asyncio.Lock()
 
 
-def allowed(request):
-    if G.cluster_key == request.headers.get('x-auth-key', None):
-        return True
-
-
 def paxos_encode(promised_seq, accepted_seq):
     result = '{}\n{}\n'.format(promised_seq, accepted_seq).encode()
     assert(32 == len(result))
@@ -39,10 +35,6 @@ def paxos_decode(input_bytes):
     return promised_seq, accepted_seq
 
 
-def response(obj):
-    return sanic.response.raw(pickle.dumps(obj))
-
-
 @APP.post('/seq-max')
 async def seq_max(request):
     return response(G.seq)
@@ -50,28 +42,32 @@ async def seq_max(request):
 
 @APP.post('/seq-next')
 async def seq_next(request):
-    if allowed(request) is not True:
+    if allowed(request.headers) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
     G.seq += 1
     return response(G.seq)
 
 
-@APP.post('/<phase:str>/<proposal_seq:str>/<key:path>')
-async def paxos_server(request, phase, proposal_seq, key):
+@APP.post('/<phase:str>/<proposal_seq:str>/<log_seq:int>')
+async def paxos_server(request, phase, proposal_seq, log_seq):
     # Format    - 'YYYYMMDD-HHMMSS'
     default_seq = '00000000-000000'
     learned_seq = '99999999-999999'
 
-    if request is not None and allowed(request) is not True:
+    if request is not None and allowed(request.headers) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
-    os.makedirs(os.path.dirname(key), exist_ok=True)
-    tmpfile = '{}-{}.tmp'.format(key, uuid.uuid4())
+    # File path for this log entry
+    log_seq = int(log_seq)
+    path = os.path.join('data', str(int(log_seq / 10000)), str(log_seq))
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmpfile = '{}-{}.tmp'.format(path, uuid.uuid4())
 
     promised_seq = accepted_seq = default_seq
-    if os.path.isfile(key):
-        with open(key, 'rb') as fd:
+    if os.path.isfile(path):
+        with open(path, 'rb') as fd:
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
 
             if request is None:
@@ -93,17 +89,17 @@ async def paxos_server(request, phase, proposal_seq, key):
 
     if 'promise' == phase and proposal_seq > promised_seq:
         # Update the header if file already exists.
-        if os.path.isfile(key):
-            with open(key, 'r+b') as fd:
+        if os.path.isfile(path):
+            with open(path, 'r+b') as fd:
                 fd.write(paxos_encode(proposal_seq, accepted_seq))
 
         # Atomically create a new file if it doesn't
         else:
             with open(tmpfile, 'wb') as fd:
                 fd.write(paxos_encode(proposal_seq, accepted_seq))
-            os.rename(tmpfile, key)
+            os.rename(tmpfile, path)
 
-        with open(key, 'rb') as fd:
+        with open(path, 'rb') as fd:
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
             return response([accepted_seq, fd.read()])
 
@@ -113,7 +109,7 @@ async def paxos_server(request, phase, proposal_seq, key):
         with open(tmpfile, 'wb') as fd:
             fd.write(paxos_encode(proposal_seq, proposal_seq))
             fd.write(pickle.loads(request.body))
-        os.rename(tmpfile, key)
+        os.rename(tmpfile, path)
 
         return response('OK')
 
@@ -122,21 +118,45 @@ async def paxos_server(request, phase, proposal_seq, key):
         # promise_seq = accepted_seq = '99999999-999999'
         # This is the largest possible value for seq and would ensure
         # tha any subsequent paxos rounds for this key accept only this value.
-        with open(key, 'r+b') as fd:
+        with open(path, 'r+b') as fd:
             fd.write(paxos_encode(learned_seq, learned_seq))
 
         return response('OK')
 
 
+def auth_headers(ts=None):
+    ts = str(int(time.time())) if ts is None else ts
+
+    auth = hmac.new(ts.encode(), G.cluster_key, hashlib.sha512).hexdigest()
+
+    return {'x-auth-ts': ts, 'x-auth-hmac': auth}
+
+
+def response(obj):
+    return sanic.response.raw(pickle.dumps(obj), headers=auth_headers())
+
+
+def allowed(headers):
+    auth_ts = headers['x-auth-ts']
+
+    if headers['x-auth-hmac'] == auth_headers(auth_ts)['x-auth-hmac']:
+        ts = time.time()
+
+        if ts - 5 < int(auth_ts) < ts + 5:
+            return True
+
+
 async def rpc(url, obj=None):
     if G.session is None:
         G.session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=1000),
-            headers={'x-auth-key': G.cluster_key})
+            connector=aiohttp.TCPConnector(limit=1000))
+
+    headers = auth_headers()
 
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
           G.session.post('https://{}/{}'.format(s, url),
+                         headers=headers,
                          data=pickle.dumps(obj), ssl=False))
           for s in G.servers],
         return_exceptions=True)
@@ -144,12 +164,13 @@ async def rpc(url, obj=None):
     result = dict()
     for s, r in zip(G.servers, responses):
         if type(r) is aiohttp.client_reqrep.ClientResponse:
-            if 200 == r.status:
+            if 200 == r.status and allowed(r.headers):
                 result[s] = pickle.loads(await r.read())
 
     return result
 
 
+# Standard PAXOS Propose flow
 async def paxos_client(key, value):
     seq_key = '{}/{}'.format(time.strftime('%Y%m%d-%H%M%S'), key)
 
@@ -171,49 +192,52 @@ async def paxos_client(key, value):
     return 'CONFLICT' if value is not proposal[1] else 'OK'
 
 
-# Form a hierarchical path to avoid too many files in a directory
-def seq2path(seq):
-    return os.path.join('data', str(int(seq / 10000)), str(seq))
-
-
 @APP.post('/')
 async def append(request):
     res = await rpc('seq-next')
     seq = max([num for num in res.values()])
 
-    if 'OK' == await paxos_client(seq2path(seq), request.body):
-        return sanic.response.json(seq, headers={
-            'x-server-seq': seq,
-            'x-server-length': len(request.body)})
+    if 'OK' == await paxos_client(seq, request.body):
+        return sanic.response.json(seq, headers={'x-seq': seq})
 
 
 @APP.get('/<seq:int>')
 async def tail(request, seq):
     seq = int(seq)
-    key = seq2path(seq)
 
+    # Let's wait for 30 seconds if this log entry does not yet exist
     for i in range(30):
         if seq <= G.seq:
             break
 
+        # Take a lock to stop all the clients from trying,
+        # Just one check is sufficient, as all were waiting for
+        # the same log entry.
         async with G.lock:
             if seq > G.seq:
                 await asyncio.sleep(1)
                 res = await rpc('seq-max')
                 G.seq = max([G.seq] + [num for num in res.values()])
 
+    # This log entry was not found in 30 seconds
     if seq > G.seq:
         return
 
+    # This log entry exist in the cluster
     for i in range(2):
-        blob = await paxos_server(None, None, seq, key)
+        # Read the currently learned value
+        blob = await paxos_server(None, None, None, seq)
 
+        # This node has the learned value
         if blob is not None:
-            return sanic.response.raw(blob, headers={
-                'x-server-seq': seq,
-                'x-server-length': len(blob)})
+            return sanic.response.raw(blob, headers={'x-seq': seq})
 
-        await paxos_client(key, b'')
+        # This node hasn't yet learned the value.
+        # Lets run a paxos round. This node will either learn
+        # the value, if cluster has already leaned it.
+        #
+        # Otherwise, value would be set to empty byte array.
+        await paxos_client(seq, b'')
 
 
 if '__main__' == __name__:
@@ -228,8 +252,8 @@ if '__main__' == __name__:
     with open('cluster.key') as fd:
         # Include server list in the cluster auth key.
         # Inconsistently configured node would reject any requests.
-        G.cluster_key = fd.read().strip() + ''.join(sorted(G.servers))
-        G.cluster_key = hashlib.md5(G.cluster_key.encode()).hexdigest()
+        tmp = fd.read().strip() + ''.join(sorted(G.servers))
+        G.cluster_key = hashlib.md5(tmp.encode()).digest()
 
     G.seq = 0
     os.makedirs('data', exist_ok=True)
@@ -246,6 +270,6 @@ if '__main__' == __name__:
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
     logging.critical('server({}:{}) seq({})'.format(G.host, G.port, G.seq))
 
-    signal.alarm(random.randint(1, 900))
+    signal.alarm(random.randint(1, 5))
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
