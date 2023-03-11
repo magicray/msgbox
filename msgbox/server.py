@@ -20,9 +20,7 @@ signal.alarm(random.randint(1, 5))
 class G:
     max_seq = None
     session = None
-
-    # DateTime  - 'YYYYMMDD-HHMMSS'
-    default_seq = '00000000-000000'
+    lock = asyncio.Lock()
 
 
 def allowed(request):
@@ -46,8 +44,13 @@ def response(obj):
     return sanic.response.raw(pickle.dumps(obj))
 
 
-@APP.post('/seq/next')
-async def next_seq(request):
+@APP.post('/seq-max')
+async def seq_max(request):
+    return response(G.max_seq)
+
+
+@APP.post('/seq-next')
+async def seq_next(request):
     if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
@@ -57,7 +60,8 @@ async def next_seq(request):
 
 @APP.post('/<phase:str>/<proposal_seq:str>/<key:path>')
 async def paxos_server(request, phase, proposal_seq, key):
-    # DateTime  - 'YYYYMMDD-HHMMSS'
+    # Format    - 'YYYYMMDD-HHMMSS'
+    default_seq = '00000000-000000'
     learned_seq = '99999999-999999'
 
     if request is not None and allowed(request) is not True:
@@ -66,7 +70,7 @@ async def paxos_server(request, phase, proposal_seq, key):
     os.makedirs(os.path.dirname(key), exist_ok=True)
     tmpfile = '{}-{}.tmp'.format(key, uuid.uuid4())
 
-    promised_seq = accepted_seq = G.default_seq
+    promised_seq = accepted_seq = default_seq
     if os.path.isfile(key):
         with open(key, 'rb') as fd:
             promised_seq, accepted_seq = paxos_decode(fd.read(32))
@@ -154,7 +158,7 @@ async def paxos_client(key, value):
     if G.quorum > len(res):
         return 'NO_PROMISE_QUORUM'
 
-    proposal = (G.default_seq, value)
+    proposal = ('00000000-000000', value)
     for srv, (accepted_seq, accepted_val) in res.items():
         if accepted_seq > proposal[0]:
             proposal = (accepted_seq, accepted_val)
@@ -170,19 +174,13 @@ async def paxos_client(key, value):
 
 # Form a hierarchical path to avoid too many files in a directory
 def seq2path(seq):
-    batch_size = 100
-
-    one = str(int(seq / batch_size) % batch_size)
-    two = str(int(seq / batch_size**2) % batch_size)
-    three = str(int(seq / batch_size**3) % batch_size)
-
-    return os.path.join('data', 'log', three, two, one, str(seq))
+    return os.path.join('data', str(int(seq / 10000)), str(seq))
 
 
 @APP.post('/')
 async def append(request):
-    res = await rpc('seq/next')
-    seq = max([obj for obj in res.values()])
+    res = await rpc('seq-next')
+    seq = max([num for num in res.values()])
 
     if 'OK' == await paxos_client(seq2path(seq), request.body):
         return sanic.response.json(seq, headers={
@@ -195,9 +193,17 @@ async def tail(request, seq):
     seq = int(seq)
     key = seq2path(seq)
 
+    for i in range(100):
+        if seq <= G.max_seq:
+            break
+
+        async with G.lock:
+            await asyncio.sleep(1)
+            res = await rpc('seq-max')
+            G.max_seq = max([G.max_seq] + [num for num in res.values()])
+
     if seq > G.max_seq:
-        await asyncio.sleep(1)
-        raise sanic.exceptions.NotFound()
+        return
 
     for i in range(2):
         blob = await paxos_server(None, None, seq, key)
@@ -224,21 +230,19 @@ if '__main__' == __name__:
 
     G.quorum = int(len(G.servers)/2) + 1
 
-    os.makedirs(os.path.join('data', 'log'), exist_ok=True)
+    G.max_seq = 0
+    os.makedirs('data', exist_ok=True)
+    for d in sorted([int(x) for x in os.listdir('data')], reverse=True):
+        dirpath = os.path.join('data', str(d))
+        files = [int(x) for x in os.listdir(dirpath) if x.isdigit()]
+        if files:
+            G.max_seq = max(files)
+            break
 
-    # Find the maximum log seq written so far
-    path = os.path.join('data', 'log')
-    for i in range(3):
-        filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
-        path = os.path.join(path, str(max(filenames)) if filenames else '0')
-        os.makedirs(path, exist_ok=True)
-
-    filenames = [int(c) for c in os.listdir(path) if c.isdigit()]
-    G.max_seq = max(filenames) if filenames else 0
-
-    logging.critical('Starting server : {}:{}'.format(G.host, G.port))
     for i, srv in enumerate(sorted(G.servers)):
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
+    logging.critical('max seq : {}'.format(G.max_seq))
+    logging.critical('starting server : {}:{}'.format(G.host, G.port))
 
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
