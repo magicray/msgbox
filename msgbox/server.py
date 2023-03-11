@@ -13,12 +13,11 @@ import logging
 
 
 APP = sanic.Sanic('logdb')
-signal.alarm(random.randint(1, 5))
 
 
 # Global variables
 class G:
-    max_seq = None
+    seq = None
     session = None
     lock = asyncio.Lock()
 
@@ -46,7 +45,7 @@ def response(obj):
 
 @APP.post('/seq-max')
 async def seq_max(request):
-    return response(G.max_seq)
+    return response(G.seq)
 
 
 @APP.post('/seq-next')
@@ -54,8 +53,8 @@ async def seq_next(request):
     if allowed(request) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
-    G.max_seq += 1
-    return response(G.max_seq)
+    G.seq += 1
+    return response(G.seq)
 
 
 @APP.post('/<phase:str>/<proposal_seq:str>/<key:path>')
@@ -193,16 +192,17 @@ async def tail(request, seq):
     seq = int(seq)
     key = seq2path(seq)
 
-    for i in range(100):
-        if seq <= G.max_seq:
+    for i in range(30):
+        if seq <= G.seq:
             break
 
         async with G.lock:
-            await asyncio.sleep(1)
-            res = await rpc('seq-max')
-            G.max_seq = max([G.max_seq] + [num for num in res.values()])
+            if seq > G.seq:
+                await asyncio.sleep(1)
+                res = await rpc('seq-max')
+                G.seq = max([G.seq] + [num for num in res.values()])
 
-    if seq > G.max_seq:
+    if seq > G.seq:
         return
 
     for i in range(2):
@@ -223,26 +223,29 @@ if '__main__' == __name__:
 
     G.host, G.port = sys.argv[1].split(':')
     G.port = int(G.port)
+    G.quorum = int(len(G.servers)/2) + 1
 
     with open('cluster.key') as fd:
+        # Include server list in the cluster auth key.
+        # Inconsistently configured node would reject any requests.
         G.cluster_key = fd.read().strip() + ''.join(sorted(G.servers))
         G.cluster_key = hashlib.md5(G.cluster_key.encode()).hexdigest()
 
-    G.quorum = int(len(G.servers)/2) + 1
-
-    G.max_seq = 0
+    G.seq = 0
     os.makedirs('data', exist_ok=True)
+
+    # Find out the latest file
     for d in sorted([int(x) for x in os.listdir('data')], reverse=True):
-        dirpath = os.path.join('data', str(d))
-        files = [int(x) for x in os.listdir(dirpath) if x.isdigit()]
+        path = os.path.join('data', str(d))
+        files = [int(x) for x in os.listdir(path) if x.isdigit()]
         if files:
-            G.max_seq = max(files)
+            G.seq = max(files)
             break
 
     for i, srv in enumerate(sorted(G.servers)):
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
-    logging.critical('max seq : {}'.format(G.max_seq))
-    logging.critical('starting server : {}:{}'.format(G.host, G.port))
+    logging.critical('server({}:{}) seq({})'.format(G.host, G.port, G.seq))
 
+    signal.alarm(random.randint(1, 900))
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
