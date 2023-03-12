@@ -36,7 +36,9 @@ def paxos_decode(input_bytes):
 
 
 def response(obj):
-    return sanic.response.raw(pickle.dumps(obj), headers=auth_headers())
+    return sanic.response.raw(
+        pickle.dumps(obj),
+        headers=auth_headers('server'))
 
 
 @APP.post('/seq-max')
@@ -46,7 +48,7 @@ async def seq_max(request):
 
 @APP.post('/seq-next')
 async def seq_next(request):
-    if allowed(request.headers) is not True:
+    if allowed('client', request.headers) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
     G.seq += 1
@@ -59,7 +61,7 @@ async def paxos_server(request, phase, proposal_seq, log_seq):
     default_seq = '00000000-000000'
     learned_seq = '99999999-999999'
 
-    if request is not None and allowed(request.headers) is not True:
+    if request is not None and allowed('client', request.headers) is not True:
         raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
     # File path for this log entry
@@ -128,16 +130,17 @@ async def paxos_server(request, phase, proposal_seq, log_seq):
         return response('OK')
 
 
-def auth_headers(ts=None):
+def auth_headers(origin, ts=None):
     ts = str(int(time.time())) if ts is None else ts
-    auth = hmac.new(ts.encode(), G.cluster_key, hashlib.sha512).hexdigest()
+    orig = origin + ts
+    auth = hmac.new(orig.encode(), G.cluster_key, hashlib.sha512).hexdigest()
     return {'x-auth-ts': ts, 'x-auth-hmac': auth}
 
 
-def allowed(headers):
+def allowed(origin, headers):
     auth_ts = headers['x-auth-ts']
 
-    if headers['x-auth-hmac'] == auth_headers(auth_ts)['x-auth-hmac']:
+    if headers['x-auth-hmac'] == auth_headers(origin, auth_ts)['x-auth-hmac']:
         ts = time.time()
 
         if ts - 5 < int(auth_ts) < ts + 5:
@@ -152,7 +155,7 @@ async def rpc(url, obj=None):
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
           G.session.post('https://{}/{}'.format(s, url),
-                         headers=auth_headers(),
+                         headers=auth_headers('client'),
                          data=pickle.dumps(obj), ssl=False))
           for s in G.servers],
         return_exceptions=True)
@@ -160,7 +163,7 @@ async def rpc(url, obj=None):
     result = dict()
     for s, r in zip(G.servers, responses):
         if type(r) is aiohttp.client_reqrep.ClientResponse:
-            if 200 == r.status and allowed(r.headers):
+            if 200 == r.status and allowed('server', r.headers):
                 result[s] = pickle.loads(await r.read())
 
     return result
@@ -266,6 +269,6 @@ if '__main__' == __name__:
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
     logging.critical('server({}:{}) seq({})'.format(G.host, G.port, G.seq))
 
-    signal.alarm(random.randint(1, 50))
+    signal.alarm(random.randint(1, 900))
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))

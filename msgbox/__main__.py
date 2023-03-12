@@ -17,8 +17,8 @@ def tail(client, seq, step):
             blob = r.pop('blob', b'')
             if blob:
                 x = hashlib.md5(blob).hexdigest()
-                y = chksum + x
-                y = hashlib.md5(y.encode()).hexdigest()
+                chksum += x
+                y = hashlib.md5(chksum.encode()).hexdigest()
                 res = 'log({}) blob({}) seq({}) len({})'.format(
                     y, x, r['seq'], len(blob))
                 sys.stderr.write(res + '\n')
