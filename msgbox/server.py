@@ -35,6 +35,10 @@ def paxos_decode(input_bytes):
     return promised_seq, accepted_seq
 
 
+def response(obj):
+    return sanic.response.raw(pickle.dumps(obj), headers=auth_headers())
+
+
 @APP.post('/seq-max')
 async def seq_max(request):
     return response(G.seq)
@@ -126,14 +130,8 @@ async def paxos_server(request, phase, proposal_seq, log_seq):
 
 def auth_headers(ts=None):
     ts = str(int(time.time())) if ts is None else ts
-
     auth = hmac.new(ts.encode(), G.cluster_key, hashlib.sha512).hexdigest()
-
     return {'x-auth-ts': ts, 'x-auth-hmac': auth}
-
-
-def response(obj):
-    return sanic.response.raw(pickle.dumps(obj), headers=auth_headers())
 
 
 def allowed(headers):
@@ -151,12 +149,10 @@ async def rpc(url, obj=None):
         G.session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=1000))
 
-    headers = auth_headers()
-
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
           G.session.post('https://{}/{}'.format(s, url),
-                         headers=headers,
+                         headers=auth_headers(),
                          data=pickle.dumps(obj), ssl=False))
           for s in G.servers],
         return_exceptions=True)
@@ -270,6 +266,6 @@ if '__main__' == __name__:
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
     logging.critical('server({}:{}) seq({})'.format(G.host, G.port, G.seq))
 
-    signal.alarm(random.randint(1, 5))
+    signal.alarm(random.randint(1, 50))
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
