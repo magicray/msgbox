@@ -1,3 +1,0 @@
-#!/bin/bash
-
-openssl req -x509 -batch -newkey rsa:4096 -keyout ssl.key -nodes -out ssl.crt -sha512 -days 1000
