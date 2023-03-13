@@ -1,7 +1,7 @@
 import sys
 import time
 import json
-import msgbox
+import logdb
 import hashlib
 
 
@@ -27,7 +27,7 @@ def tail(client, seq, step):
 
 
 if '__main__' == __name__:
-    client = msgbox.Client(sys.argv[1].split(','))
+    client = logdb.Client(sys.argv[1].split(','))
 
     if 2 == len(sys.argv):
         append(client, sys.stdin.read())

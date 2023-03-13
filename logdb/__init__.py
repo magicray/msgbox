@@ -8,6 +8,7 @@ class Client:
     def __init__(self, servers):
         self.servers = servers
         self.session = requests.Session()
+        self.session.cert = ('ssl.crt', 'ssl.key')
         self.session.verify = False
 
     def tail(self, seq, step=1):

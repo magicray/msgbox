@@ -1,6 +1,6 @@
 import os
 import sys
-import hmac
+import ssl
 import time
 import uuid
 import sanic
@@ -19,6 +19,7 @@ APP = sanic.Sanic('logdb')
 # Global variables
 class G:
     seq = None
+    ssl_ctx = None
     session = None
     lock = asyncio.Lock()
 
@@ -36,9 +37,7 @@ def paxos_decode(input_bytes):
 
 
 def response(obj):
-    return sanic.response.raw(
-        pickle.dumps(obj),
-        headers=auth_headers('server'))
+    return sanic.response.raw(pickle.dumps(obj))
 
 
 @APP.post('/seq-max')
@@ -48,9 +47,6 @@ async def seq_max(request):
 
 @APP.post('/seq-next')
 async def seq_next(request):
-    if allowed('client', request.headers) is not True:
-        raise sanic.exceptions.Unauthorized('Unauthorized Request')
-
     G.seq += 1
     return response(G.seq)
 
@@ -60,9 +56,6 @@ async def paxos_server(request, phase, proposal_seq, log_seq):
     # Format    - 'YYYYMMDD-HHMMSS'
     default_seq = '00000000-000000'
     learned_seq = '99999999-999999'
-
-    if request is not None and allowed('client', request.headers) is not True:
-        raise sanic.exceptions.Unauthorized('Unauthorized Request')
 
     # File path for this log entry
     log_seq = int(log_seq)
@@ -130,40 +123,28 @@ async def paxos_server(request, phase, proposal_seq, log_seq):
         return response('OK')
 
 
-def auth_headers(origin, ts=None):
-    ts = str(int(time.time())) if ts is None else ts
-    orig = origin + ts
-    auth = hmac.new(orig.encode(), G.cluster_key, hashlib.sha512).hexdigest()
-    return {'x-auth-ts': ts, 'x-auth-hmac': auth}
-
-
-def allowed(origin, headers):
-    auth_ts = headers['x-auth-ts']
-
-    if headers['x-auth-hmac'] == auth_headers(origin, auth_ts)['x-auth-hmac']:
-        ts = time.time()
-
-        if ts - 5 < int(auth_ts) < ts + 5:
-            return True
-
-
 async def rpc(url, obj=None):
     if G.session is None:
+        G.ssl_ctx = ssl.create_default_context(
+            cafile='ssl.crt',
+            purpose=ssl.Purpose.SERVER_AUTH)
+        G.ssl_ctx.check_hostname = False
+        G.ssl_ctx.load_cert_chain('ssl.crt', 'ssl.key')
+
         G.session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=1000))
 
     responses = await asyncio.gather(
         *[asyncio.ensure_future(
           G.session.post('https://{}/{}'.format(s, url),
-                         headers=auth_headers('client'),
-                         data=pickle.dumps(obj), ssl=False))
+                         data=pickle.dumps(obj), ssl=G.ssl_ctx))
           for s in G.servers],
         return_exceptions=True)
 
     result = dict()
     for s, r in zip(G.servers, responses):
         if type(r) is aiohttp.client_reqrep.ClientResponse:
-            if 200 == r.status and allowed('server', r.headers):
+            if 200 == r.status:
                 result[s] = pickle.loads(await r.read())
 
     return result
@@ -269,6 +250,13 @@ if '__main__' == __name__:
         logging.critical('cluster node({}) : {}'.format(i+1, srv))
     logging.critical('server({}:{}) seq({})'.format(G.host, G.port, G.seq))
 
-    signal.alarm(random.randint(1, 900))
+    ssl_ctx = ssl.create_default_context(
+        cafile='ssl.crt',
+        purpose=ssl.Purpose.CLIENT_AUTH)
+    ssl_ctx.load_cert_chain('ssl.crt', 'ssl.key')
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_REQUIRED
+
+    signal.alarm(random.randint(1, 9))
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
-            ssl=dict(cert='ssl.crt', key='ssl.key', names=['*']))
+            ssl=ssl_ctx)

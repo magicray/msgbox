@@ -3,10 +3,6 @@
 SERVERS="localhost:8001 localhost:8002 localhost:8003 localhost:8004 localhost:8005"
 
 while true; do
-    #openssl req -x509 -batch -newkey rsa:4096 -nodes -sha512 -days 100 \
-    #            -keyout ssl.key -out ssl.crt
-
-    python3 -mmsgbox.server $1 $SERVERS
-
+    python3 -mlogdb.server $1 $SERVERS
     sleep 1
 done
