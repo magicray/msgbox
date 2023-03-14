@@ -7,10 +7,10 @@ import sanic
 import signal
 import pickle
 import random
-import hashlib
 import asyncio
 import aiohttp
 import logging
+from sanic.exceptions import Unauthorized
 
 
 APP = sanic.Sanic('logdb')
@@ -21,6 +21,7 @@ class G:
     seq = None
     ssl_ctx = None
     session = None
+    cluster = None
     lock = asyncio.Lock()
 
 
@@ -40,19 +41,38 @@ def response(obj):
     return sanic.response.raw(pickle.dumps(obj))
 
 
+def get_peer(request):
+    peercert = request.transport.get_extra_info('peercert')
+    sub = dict(peercert['subject'][0])
+    return sub['commonName']
+
+
 @APP.post('/seq-max')
 async def seq_max(request):
+    peer = get_peer(request)
+    if peer not in G.cluster:
+        raise Unauthorized('NOT_IN_CLUSTER: {}'.format(peer))
+
     return response(G.seq)
 
 
 @APP.post('/seq-next')
 async def seq_next(request):
+    peer = get_peer(request)
+    if peer not in G.cluster:
+        raise Unauthorized('NOT_IN_CLUSTER: {}'.format(peer))
+
     G.seq += 1
     return response(G.seq)
 
 
 @APP.post('/<phase:str>/<proposal_seq:str>/<log_seq:int>')
 async def paxos_server(request, phase, proposal_seq, log_seq):
+    if request is not None:
+        peer = get_peer(request)
+        if peer not in G.cluster:
+            raise Unauthorized('NOT_IN_CLUSTER: {}'.format(peer))
+
     # Format    - 'YYYYMMDD-HHMMSS'
     default_seq = '00000000-000000'
     learned_seq = '99999999-999999'
@@ -174,6 +194,10 @@ async def paxos_client(key, value):
 
 @APP.post('/')
 async def append(request):
+    peer = get_peer(request)
+    if not peer.startswith('uuid:'):
+        raise Unauthorized('Unauthorized client: {}'.format(peer))
+
     res = await rpc('seq-next')
     seq = max([num for num in res.values()])
 
@@ -222,8 +246,10 @@ async def tail(request, seq):
 
 if '__main__' == __name__:
     G.servers = set()
+    G.cluster = set()
     for i in range(1, len(sys.argv)):
         G.servers.add(sys.argv[i])
+        G.cluster.add(sys.argv[i].split(':')[0])
 
     G.host, G.port = sys.argv[1].split(':')
     G.port = int(G.port)
