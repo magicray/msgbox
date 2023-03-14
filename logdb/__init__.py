@@ -8,8 +8,8 @@ class Client:
     def __init__(self, servers):
         self.servers = servers
         self.session = requests.Session()
-        self.session.cert = ('ssl.crt', 'ssl.key')
-        self.session.verify = False
+        self.session.cert = ('client.pem', 'client.key')
+        self.session.verify = 'ca.pem'
 
     def tail(self, seq, step=1):
         while True:

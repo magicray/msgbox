@@ -126,10 +126,10 @@ async def paxos_server(request, phase, proposal_seq, log_seq):
 async def rpc(url, obj=None):
     if G.session is None:
         G.ssl_ctx = ssl.create_default_context(
-            cafile='ssl.crt',
+            cafile='ca.pem',
             purpose=ssl.Purpose.SERVER_AUTH)
-        G.ssl_ctx.check_hostname = False
-        G.ssl_ctx.load_cert_chain('ssl.crt', 'ssl.key')
+        G.ssl_ctx.load_cert_chain('server.pem', 'server.key')
+        G.ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
         G.session = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(limit=1000))
@@ -229,12 +229,6 @@ if '__main__' == __name__:
     G.port = int(G.port)
     G.quorum = int(len(G.servers)/2) + 1
 
-    with open('cluster.key') as fd:
-        # Include server list in the cluster auth key.
-        # Inconsistently configured node would reject any requests.
-        tmp = fd.read().strip() + ''.join(sorted(G.servers))
-        G.cluster_key = hashlib.md5(tmp.encode()).digest()
-
     G.seq = 0
     os.makedirs('data', exist_ok=True)
 
@@ -251,10 +245,9 @@ if '__main__' == __name__:
     logging.critical('server({}:{}) seq({})'.format(G.host, G.port, G.seq))
 
     ssl_ctx = ssl.create_default_context(
-        cafile='ssl.crt',
+        cafile='ca.pem',
         purpose=ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain('ssl.crt', 'ssl.key')
-    ssl_ctx.check_hostname = False
+    ssl_ctx.load_cert_chain('server.pem', 'server.key')
     ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
     signal.alarm(random.randint(1, 9))
