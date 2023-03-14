@@ -43,24 +43,21 @@ def response(obj):
 
 def get_peer(request):
     peercert = request.transport.get_extra_info('peercert')
-    sub = dict(peercert['subject'][0])
-    return sub['commonName']
+    return dict(peercert['subject'][0])['commonName']
 
 
 @APP.post('/seq-max')
 async def seq_max(request):
-    peer = get_peer(request)
-    if peer not in G.cluster:
-        raise Unauthorized('NOT_IN_CLUSTER: {}'.format(peer))
+    if get_peer(request) not in G.cluster:
+        raise Unauthorized(get_peer(request))
 
     return response(G.seq)
 
 
 @APP.post('/seq-next')
 async def seq_next(request):
-    peer = get_peer(request)
-    if peer not in G.cluster:
-        raise Unauthorized('NOT_IN_CLUSTER: {}'.format(peer))
+    if get_peer(request) not in G.cluster:
+        raise Unauthorized(get_peer(request))
 
     G.seq += 1
     return response(G.seq)
@@ -68,10 +65,8 @@ async def seq_next(request):
 
 @APP.post('/<phase:str>/<proposal_seq:str>/<log_seq:int>')
 async def paxos_server(request, phase, proposal_seq, log_seq):
-    if request is not None:
-        peer = get_peer(request)
-        if peer not in G.cluster:
-            raise Unauthorized('NOT_IN_CLUSTER: {}'.format(peer))
+    if request is not None and get_peer(request) not in G.cluster:
+        raise Unauthorized(get_peer(request))
 
     # Format    - 'YYYYMMDD-HHMMSS'
     default_seq = '00000000-000000'
@@ -194,9 +189,8 @@ async def paxos_client(key, value):
 
 @APP.post('/')
 async def append(request):
-    peer = get_peer(request)
-    if not peer.startswith('uuid:'):
-        raise Unauthorized('Unauthorized client: {}'.format(peer))
+    if not get_peer(request).startswith('uuid:'):
+        raise Unauthorized(get_peer(request))
 
     res = await rpc('seq-next')
     seq = max([num for num in res.values()])
@@ -276,6 +270,6 @@ if '__main__' == __name__:
     ssl_ctx.load_cert_chain('server.pem', 'server.key')
     ssl_ctx.verify_mode = ssl.CERT_REQUIRED
 
-    signal.alarm(random.randint(1, 9))
+    signal.alarm(random.randint(1, 900))
     APP.run(host=G.host, port=G.port, single_process=True, access_log=True,
             ssl=ssl_ctx)

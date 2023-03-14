@@ -4,7 +4,7 @@
     mkdir -p CA
     openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 2000 \
         -keyout CA/cacert.key -out CA/cacert.pem                 \
-        -subj "/C=/ST=/L=/O=/OU=/CN=self.signed.certificate"
+        -subj "/CN=self.signed.certificate"
     openssl x509 -in CA/cacert.pem -text -noout
 }
 
@@ -13,7 +13,7 @@
     openssl genrsa -out $1.key 2048
     openssl req -new -key $1.key -out $1.csr -subj "/CN=$1"
     openssl x509 -req -in $1.csr -CA CA/cacert.pem -CAkey CA/cacert.key \
-        -set_serial $(date +%s) -days 365 -sha256 -out $1.pem
+        -set_serial $(date +%s) -days 400 -sha256 -out $1.pem
     rm $1.csr
     openssl x509 -in $1.pem -text -noout
 }
